@@ -174,7 +174,7 @@ Update this table after every approach. **This is the scoreboard.**
 
 | Version | Approach | Val F₀.₅ | Val Precision | Val Recall | Blocking Recall | Threshold | Notes |
 |---|---|---|---|---|---|---|---|
-| v1 | — | — | — | — | — | — | — |
+| `v1` | `v1-tfidf-lgbm-baseline` | 0.1214 | 0.1616 | 0.0851 | 99.60% | 0.46 | Initial baseline in pipeline.ipynb |
 
 ---
 

@@ -1,0 +1,34 @@
+approach: v1-tfidf-lgbm-baseline
+model:
+  type: LightGBM
+  n_estimators: 200
+  learning_rate: 0.05
+  max_depth: 6
+  num_leaves: 31
+  scale_pos_weight: auto
+blocking:
+  method: Dual-Channel Sparse TF-IDF (char 3-4 grams)
+  country_partitioned: true
+  top_n_name: 20
+  threshold_name: 0.35
+  top_n_addr: 10
+  threshold_addr: 0.40
+  max_candidates_per_entity: 35
+features:
+  - name_lev
+  - name_jw
+  - name_sort
+  - name_set
+  - addr_lev
+  - addr_jw
+  - addr_set
+  - postal_exact
+  - postal_prefix
+  - bldg_match
+  - suffix_match
+  - suffix_conflict
+  - tfidf_name_sim
+  - tfidf_addr_sim
+evaluation:
+  metric: Macro F0.5
+  cv: 5-Fold GroupKFold (grouped by S1 entity)
