@@ -1,4 +1,4 @@
-﻿*.pyc
+*.pyc
 __pycache__/
 .ipynb_checkpoints/
 *.egg-info/
@@ -10,3 +10,9 @@ models/
 *.pt
 *.bin
 *.safetensors
+.venv/
+*.tsv
+student_resource/dataset/
+dataset/
+output/
+.DS_Store
