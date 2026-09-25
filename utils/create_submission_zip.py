@@ -66,6 +66,7 @@ def run_validator(matching_path, candidate_path, test_dir):
         "--matching", matching_path,
         "--candidate", candidate_path,
         "--test-dir", test_dir,
+        "--check-id",
     ]
     print(f"[INFO] Running submission validator: {' '.join(cmd)}")
     p = subprocess.run(cmd)
@@ -103,7 +104,7 @@ def main():
     parser = argparse.ArgumentParser(description="Build Amazon ML Challenge submission zip package.")
     parser.add_argument(
         "--team-name", "-t",
-        default="team_solution",
+        default="Kya_hi_kare",
         help="Team name used for the zip file (<team_name>_submission.zip). Default: %(default)s",
     )
     parser.add_argument(

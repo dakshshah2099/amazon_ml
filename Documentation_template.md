@@ -1,7 +1,5 @@
-# ML Challenge 2026: Business Entity Resolution Solution Template
-
-**Team Name:** [To be filled by participant]  
-**Team Members:** [To be filled by participant]  
+**Team Name:** Kya_hi_kare
+**Team Members:** Daksh Shah, Mahir Shah, Hemil Shah, Ansh Patel
 **Submission Date:** September 2026
 
 ---
