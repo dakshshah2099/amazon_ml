@@ -1,0 +1,67 @@
+version: "v2-precision-engineered-gbdt"
+model:
+  framework: "lightgbm"
+  boosting_type: "gbdt"
+  objective: "binary"
+  metric: "binary_logloss"
+  learning_rate: 0.05
+  num_leaves: 31
+  max_depth: 6
+  min_child_samples: 20
+  subsample: 0.8
+  colsample_bytree: 0.8
+  n_estimators: 300
+  early_stopping_rounds: 25
+  group_kfold_splits: 5
+  scale_pos_weight: "dynamic_imbalance"
+
+blocking:
+  country_partition: "df.groupby('country', sort=False)"
+  name_tfidf:
+    analyzer: "char_wb"
+    ngram_range: [3, 4]
+    max_features: 50000
+    top_n: 35
+    threshold: 0.25
+  addr_tfidf:
+    analyzer: "char_wb"
+    ngram_range: [3, 4]
+    max_features: 50000
+    top_n: 20
+    threshold: 0.30
+  max_total_cands_per_entity: 50
+
+features:
+  lexical_name:
+    - name_lev
+    - name_jw
+    - name_sort
+    - name_set
+    - name_partial
+    - name_exact
+    - first_token_match
+    - name_len_diff
+  lexical_address:
+    - addr_lev
+    - addr_jw
+    - addr_sort
+    - addr_set
+    - addr_partial
+    - addr_exact
+    - addr_len_diff
+  structural_and_conflicts:
+    - postal_exact
+    - postal_prefix
+    - postal_conflict
+    - bldg_match
+    - bldg_conflict
+    - suffix_match
+    - suffix_conflict
+  retrieval:
+    - tfidf_name_sim
+    - tfidf_addr_sim
+
+post_processing:
+  strategy: "1-to-1 argmax candidate assignment"
+  calibration_metric: "exact macro F0.5"
+  optimal_threshold: 0.91

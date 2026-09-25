@@ -1,0 +1,29 @@
+{
+  "approach": "v2-precision-engineered-gbdt",
+  "branch": "approach/v2-precision-engineered-gbdt",
+  "evaluation_set": {
+    "num_s1_entities": 2000,
+    "num_s23_candidates": 26849,
+    "total_ground_truth_matches": 6865,
+    "matches_in_candidate_pool": 6865
+  },
+  "metrics": {
+    "val_macro_f05": 0.9846,
+    "val_macro_precision": 0.9915,
+    "val_macro_recall": 0.9695,
+    "blocking_recall": 0.9955,
+    "optimal_threshold": 0.91
+  },
+  "candidate_blocking": {
+    "candidate_pairs_generated": 79530,
+    "recalled_matches": 6834,
+    "total_matches": 6865,
+    "recall_rate": 0.995484
+  },
+  "submission_validation": {
+    "status": "PASS",
+    "validator_script": "student_resource/utils/validate_submission.py",
+    "checked_id": true,
+    "num_test_rows": 1732544
+  }
+}

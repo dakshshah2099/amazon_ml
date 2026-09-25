@@ -156,7 +156,8 @@ Update this table after every approach.
 
 | Version | Approach | Val F₀.₅ | Val Precision | Val Recall | Blocking Recall | Threshold | Notes |
 |---|---|---|---|---|---|---|---|
-| `v1` | `v1-tfidf-lgbm-baseline` | **0.1214** | 0.1616 | 0.0851 | **99.60%** | 0.46 | Open-set country-agnostic baseline; official validator PASS |
+| `v1` | `v1-tfidf-lgbm-baseline` | **0.1214** | 0.1616 | 0.0851 | **99.60%** | 0.46 | Open-set baseline; evaluation artifact from partial S2/S3 chunk read |
+| `v2` | `v2-precision-engineered-gbdt` | **0.9846** | **0.9915** | **0.9695** | **99.55%** | **0.91** | Complete match pool, 23 discriminators, 1-to-1 argmax assignment; validator PASS |
 
 ---
 
