@@ -6,195 +6,182 @@
 
 ## 🎯 Mission
 
-Match business records from Source 2/3 to Source 1 (deduplicated reference).
-**Metric: F₀.₅** — precision 2× over recall. False merges are ~4× worse than missed links.
+Match business records from Source 2 and Source 3 to Source 1 (deduplicated reference).
+**Metric: Macro F₀.₅** — precision weighted 2× over recall. False merges are ~4× worse than missed links. Singletons correctly predicted empty receive full 1.0 credit.
 
-## ⚡ Critical Rules
+---
 
-1. **NO external APIs/data** — no geocoding, no business lookup, no internet augmentation. Disqualification.
+## ⚡ Critical Rules & Strict Compliance
+
+1. **NO external APIs/data** — No geocoding, no business registries, no web lookup. Instant disqualification.
 2. **≤8B params, MIT/Apache 2.0 license only.**
-3. **France is UNSEEN** — train has US + India; test adds France. Never hardcode country lists.
-4. **Singletons = free points** — correctly predicting "no match" scores 1.0. One false merge = 0.0.
-5. **When in doubt, DON'T match.** Restraint is rewarded.
+3. **OPEN-SET COUNTRY COMPLIANCE (ZERO HARDCODING)**:
+   - Train has US and India; test adds France and potentially other unseen countries.
+   - **NEVER hardcode country strings** (`US`, `India`, `France`, etc.) in any `if country == '...'`, regex branch, or one-hot encoding.
+   - Treat `country` strictly as an open set of string labels.
+   - Dynamic country partitioning MUST use `df.groupby('country', sort=False)`.
+   - All address normalizations (postal codes, landmarks, road abbreviations) MUST run universally without country conditionals.
+4. **Singletons = Free Points**:
+   - Singletons represent 5–15%+ of reference entities.
+   - Correctly predicting an empty match list (`""`) scores a perfect **1.0**.
+   - Predicting a single false match on a singleton drops its score to **0.0**.
+5. **Precision First**: When model confidence is uncertain, **DO NOT match**. Restraint maximizes $F_{0.5}$.
+6. **Folder Structure Compliance**:
+   - Solutions must strictly conform to the Amazon ML Challenge final submission directory hierarchy.
 
 ---
 
-## 🏗️ Pipeline (Every Approach Must Follow This Shape)
+## 🏗️ Pipeline Architecture
 
 ```
-[1. Preprocess]  →  [2. Block]  →  [3. Score Pairs]  →  [4. Threshold + Post-process]  →  Output
-     ↓                  ↓               ↓                        ↓
-  Normalize         candidate_      feature vec             matching_
-  names/addr        pairs.tsv       or model prob           results.tsv
-```
-
-### Stage 1 — Preprocessing
-- Unicode NFKD (strip French diacritics: é→e, ç→c, œ→oe)
-- Legal suffix extraction → canonical tag (PVT_LTD, SARL, INC, LLC…)
-- Abbreviation expansion (Corp→Corporation, Rd→Road, &→and)
-- Postal code extraction (US 5-digit, India 6-digit, France 5-digit)
-- Landmark removal for Indian addresses
-
-### Stage 2 — Blocking (candidate_pairs.tsv)
-- **Goal: recall > 98%.** Missed pairs are irrecoverable.
-- Hybrid multi-pass union is the winning strategy:
-  - Rule-based: country + postal prefix + soundex
-  - Sparse: TF-IDF char 3-4 grams → `sparse_dot_topn` top-K (threshold ~0.40)
-  - Dense: sentence-transformer bi-encoder → FAISS HNSW top-K (cosine > 0.70)
-- Cap at ~50 candidates per S1 entity after union + dedup
-
-### Stage 3 — Pairwise Scoring
-- **Option A (baseline):** ~30 handcrafted features → LightGBM
-  - Name: Levenshtein, Jaro-Winkler, token sort/set, Jaccard, Monge-Elkan, Soft TF-IDF, char n-gram Jaccard
-  - Phonetic: Soundex, Metaphone, NYSIIS match flags
-  - Address: string metrics, postal exact/prefix match, building match
-  - Suffix match/conflict, country match, embedding cosine
-- **Option B (higher ceiling):** DeBERTa-v3-base cross-encoder (86M params)
-- **Option C (hybrid):** Features + cross-encoder score → LightGBM ensemble
-
-### Stage 4 — Threshold & Post-processing
-- Tune threshold on **macro F₀.₅** via OOF predictions → expect optimal τ ≈ 0.72–0.85
-- Singleton gate: if max(P(match)) < τ → empty list
-- Veto rules: country mismatch → reject; postal prefix mismatch → reject
-- Optional: reciprocal NN, top1–top2 margin filter
-
----
-
-## 📐 Validation
-
-```python
-# GroupKFold by S1 entity — NEVER random KFold on pairs
-from sklearn.model_selection import GroupKFold
-gkf = GroupKFold(n_splits=5)
-for train_idx, val_idx in gkf.split(data, groups=data['source1_entity_id']):
-    ...
-```
-
-Always run before submit:
-```bash
-python utils/validate_submission.py --matching output/matching_results.tsv --candidate output/candidate_pairs.tsv --test-dir dataset/test
+Raw Records (S1, S2, S3)
+    │
+    ▼
+[1. UNIVERSAL PREPROCESSING]
+    • Unicode NFKD decomposition (strips accents/ligatures globally: é→e, ç→c, œ→oe)
+    • URL/Domain cleaning (maurewilliamscolombier.com → maurewilliamscolombier)
+    • Universal postal regex (\b[1-9]\d{2}\s?\d{3}\b|\b\d{5}(?:-\d{4})?\b)
+    • Universal landmark removal (near, opp, behind, next to...)
+    • Universal legal suffix canonicalization (INC, LLC, PVT_LTD, SARL, SAS...)
+    • Universal road expansions (rd→road, st→street, ave→avenue, bd→boulevard...)
+    │
+    ▼
+[2. OPEN-SET CANDIDATE BLOCKING] → candidate_pairs.tsv
+    • Dynamic Country Partitioning: df.groupby('country', sort=False) (zero country lists)
+    • Dual-Channel TF-IDF:
+      - Channel A: Character 3-4 grams on Clean Name (top-20, threshold ≥ 0.35)
+      - Channel B: Character 3-4 grams on Clean Address (top-10, threshold ≥ 0.40)
+      - Bounded vocabulary: max_features=50000 for sub-second sparse operations
+    • Fast Vectorized Union: Sparse COO matrix merge, capped at top-35 candidates/entity
+    • Blocking Recall target: > 98.5%
+    │
+    ▼
+[3. VECTORIZED PAIRWISE FEATURES]
+    • Clean DataFrame merge on entity IDs (zero positional index mismatch)
+    • RapidFuzz string metrics: Levenshtein, Jaro-Winkler, Token Sort, Token Set
+    • Structural features: exact postal match, postal 3-prefix match, building number match
+    • Suffix features: legal suffix match (1.0), legal suffix conflict (1.0)
+    • Retrieval signals: Name TF-IDF similarity, Address TF-IDF similarity
+    │
+    ▼
+[4. CLASSIFIER & MACRO F₀.₅ OPTIMIZATION]
+    • 5-Fold GroupKFold strictly grouped by source1_entity_id (zero leakage)
+    • LightGBM GBDT with class imbalance compensation
+    • Threshold optimization sweep over OOF probabilities maximizing exact macro F₀.₅
+    • Strict singleton preservation gate (max P < τ → empty match set)
+    │
+    ▼
+[5. SUBMISSION & PACKAGING]
+    • matching_results.tsv (leaderboard) & candidate_pairs.tsv (audit)
+    • Validated with student_resource/utils/validate_submission.py
+    • Packaged with utils/create_submission_zip.py
 ```
 
 ---
 
-## 🧰 Core Libraries
+## 📁 Official Submission Package Hierarchy
 
-| Purpose | Library |
-|---|---|
-| String metrics | `rapidfuzz` |
-| Phonetics | `jellyfish` |
-| TF-IDF | `scikit-learn` |
-| Sparse blocking | `sparse_dot_topn` |
-| Dense blocking | `sentence-transformers` + `faiss-cpu` |
-| LSH | `datasketch` |
-| Classifier | `lightgbm` |
-| Cross-encoder | `transformers` (DeBERTa-v3) |
+The submission archive and repository MUST adhere to this exact hierarchy:
+
+```
+amazon_ml/
+├── output/
+│   ├── matching_results.tsv        # Scored on leaderboard
+│   └── candidate_pairs.tsv         # Candidate set audit
+├── code/
+│   └── business_entity_resolution/
+│       ├── src/
+│       │   └── pipeline.ipynb      # Primary executable pipeline notebook
+│       ├── README.md               # End-to-end reproduction guide
+│       └── requirements.txt        # Pinned dependencies
+├── Documentation_template.md       # Filled methodology write-up at root
+├── dataset/                        # Junction/symlink -> student_resource/dataset
+│   ├── train/
+│   │   ├── train_source1.tsv
+│   │   ├── train_source2.tsv
+│   │   ├── train_source3.tsv
+│   │   └── train_ground_truth.tsv
+│   └── test/
+│       ├── test_source1.tsv
+│       ├── test_source2.tsv
+│       └── test_source3.tsv
+├── student_resource/               # Provided challenge utilities & README
+│   └── utils/
+│       └── validate_submission.py
+├── utils/
+│   └── create_submission_zip.py    # Automated packaging & validation CLI
+├── experiments/                    # Versioned approach logs & configs
+│   └── v1-tfidf-lgbm-baseline/
+│       ├── config.yaml
+│       ├── results.json
+│       └── notes.md
+├── AGENTS.md                       # ← You are here (Playbook)
+└── AGENT_GUIDE.md                  # Comprehensive technical guide
+```
 
 ---
 
-## 🔖 Approach Versioning & Naming Convention
+## 🔖 Versioning & Git Workflow
 
 > [!IMPORTANT]
 > **Every approach MUST have a versioned name and its own git branch.**
-> This is non-negotiable. We need full traceability and easy rollback.
 
-### Naming Format
-```
-v{N}-{short-descriptive-name}
-```
+### Branch & Version Format
+`approach/v{N}-{short-descriptive-name}`
 
 ### Examples
 | Version | Branch | Description |
 |---|---|---|
-| `v1-tfidf-lgbm-baseline` | `approach/v1-tfidf-lgbm-baseline` | TF-IDF blocking + 30 features + LightGBM |
-| `v2-dense-blocking` | `approach/v2-dense-blocking` | Add FAISS ANN blocking to v1 |
-| `v3-deberta-cross-encoder` | `approach/v3-deberta-cross-encoder` | Replace LightGBM with DeBERTa-v3-base |
-| `v4-hybrid-ensemble` | `approach/v4-hybrid-ensemble` | Features + DeBERTa score → LightGBM |
-| `v5-french-tuning` | `approach/v5-french-tuning` | Country-specific normalization for France |
+| `v1-tfidf-lgbm-baseline` | `approach/v1-tfidf-lgbm-baseline` | Open-set dual TF-IDF + RapidFuzz + GroupKFold LightGBM |
+| `v2-dense-ann-blocking` | `approach/v2-dense-ann-blocking` | Add multilingual BGE-M3 / MiniLM FAISS blocking to v1 |
+| `v3-deberta-reranker` | `approach/v3-deberta-reranker` | Cross-encoder pairwise scoring on top candidate pairs |
+| `v4-hybrid-ensemble` | `approach/v4-hybrid-ensemble` | Ensemble GBDT + Cross-Encoder probabilities |
 
 ### Workflow
 ```bash
-# Starting a new approach
+# 1. Start new approach from main
 git checkout main
-git checkout -b approach/v2-dense-blocking
+git checkout -b approach/v2-dense-ann-blocking
 
-# Working on it...
-git add -A && git commit -m "v2: add FAISS HNSW blocking, cosine>0.70"
-
-# Recording results
-# Update the results table in this file (see below)
-
-# Merging winner into main
-git checkout main
-git merge approach/v2-dense-blocking
-```
-
-### Directory Structure Per Approach
-```
-amazon_ml/
-├── AGENTS.md                    # ← You are here
-├── AGENT_GUIDE.md               # Detailed reference
-├── guides/                      # Deep-dive guides
-│   ├── 01_blocking_strategies.md
-│   ├── 02_feature_engineering.md
-│   ├── 03_models_and_approaches.md
-│   └── 04_competition_strategies.md
-├── dataset/
-│   ├── train/                   # train_source{1,2,3}.tsv + ground truth
-│   └── test/                    # test_source{1,2,3}.tsv
-├── src/                         # Active source code (current best approach)
-│   ├── preprocess.py
-│   ├── blocking.py
-│   ├── features.py
-│   ├── model.py
-│   ├── predict.py
-│   └── config.py                # Hyperparams, thresholds, model paths
-├── experiments/                  # Per-approach experiment logs & configs
-│   ├── v1-tfidf-lgbm-baseline/
-│   │   ├── config.yaml
-│   │   ├── results.json         # {f05_val, precision, recall, threshold}
-│   │   └── notes.md
-│   └── v2-dense-blocking/
-│       ├── config.yaml
-│       ├── results.json
-│       └── notes.md
-├── output/                      # Submission files
-│   ├── matching_results.tsv
-│   └── candidate_pairs.tsv
-├── utils/
-│   └── validate_submission.py
-└── requirements.txt
+# 2. Iterate in code/business_entity_resolution/src/pipeline.ipynb
+# 3. Log results in experiments/v2-dense-ann-blocking/ and update Results Tracker below
+# 4. Commit and merge winner into main
 ```
 
 ---
 
-## 📊 Results Tracker
+## 📊 Results Tracker (Scoreboard)
 
-Update this table after every approach. **This is the scoreboard.**
+Update this table after every approach.
 
 | Version | Approach | Val F₀.₅ | Val Precision | Val Recall | Blocking Recall | Threshold | Notes |
 |---|---|---|---|---|---|---|---|
-| `v1` | `v1-tfidf-lgbm-baseline` | 0.1214 | 0.1616 | 0.0851 | 99.60% | 0.46 | Initial baseline in pipeline.ipynb |
+| `v1` | `v1-tfidf-lgbm-baseline` | **0.1214** | 0.1616 | 0.0851 | **99.60%** | 0.46 | Open-set country-agnostic baseline; official validator PASS |
 
 ---
 
-## 🚫 Anti-Patterns (Hard Rules)
+## 🚫 Hard Anti-Patterns (NEVER Do These)
 
-- ❌ Never use `connected_components` / single-linkage clustering — one false edge contaminates entire cluster
-- ❌ Never random KFold on pairs — use GroupKFold by S1 entity
-- ❌ Never hardcode `country in ['US', 'India']` — France is in test
-- ❌ Never optimize for accuracy or log-loss — tune on macro F₀.₅
-- ❌ Never skip blocking recall measurement — irrecoverable loss
-- ❌ Never submit without running `validate_submission.py`
-- ❌ Never use external APIs (geocoding, business lookup) — instant disqualification
+- ❌ **NEVER hardcode country strings** (`if country in ['US', 'India', 'France']`, `if country == 'us'`). Country is an open string set.
+- ❌ **NEVER use single-linkage / connected components clustering** — a single false link corrupts the entire cluster.
+- ❌ **NEVER use random K-Fold on candidate pairs** — causes massive data leakage. ALWAYS use `GroupKFold` on `source1_entity_id`.
+- ❌ **NEVER optimize for accuracy or log-loss** — always tune decision thresholds directly on macro $F_{0.5}$.
+- ❌ **NEVER skip blocking recall measurement** — missed pairs at blocking can never be recovered. Target $>98.5\%$.
+- ❌ **NEVER diverge from official folder structure** — root `output/`, `code/business_entity_resolution/src/pipeline.ipynb`, root `Documentation_template.md`.
+- ❌ **NEVER commit large TSVs, models, or zip files to git** — keep `.gitignore` strictly enforced.
+- ❌ **NEVER submit without running validator** — always verify exit code 0 via `validate_submission.py`.
 
 ---
 
-## 📎 Reference Guides
+## 🛠️ Essential Commands
 
-For deep dives, see:
-- [AGENT_GUIDE.md](file:///C:/Users/daksh/Desktop/amazon_ml/AGENT_GUIDE.md) — Full pipeline architecture & tech stack
-- [01_blocking_strategies.md](file:///C:/Users/daksh/Desktop/amazon_ml/guides/01_blocking_strategies.md) — All blocking methods with code
-- [02_feature_engineering.md](file:///C:/Users/daksh/Desktop/amazon_ml/guides/02_feature_engineering.md) — 30-feature vector, normalization, phonetics
-- [03_models_and_approaches.md](file:///C:/Users/daksh/Desktop/amazon_ml/guides/03_models_and_approaches.md) — GBDT vs cross-encoder vs LLM
-- [04_competition_strategies.md](file:///C:/Users/daksh/Desktop/amazon_ml/guides/04_competition_strategies.md) — F₀.₅ tuning, singletons, precision tricks
+```powershell
+# 1. Run pipeline notebook
+jupyter execute code/business_entity_resolution/src/pipeline.ipynb
+
+# 2. Validate submission outputs locally
+python student_resource/utils/validate_submission.py --matching output/matching_results.tsv --candidate output/candidate_pairs.tsv --test-dir dataset/test
+
+# 3. Build verified submission archive
+python utils/create_submission_zip.py --team-name <your_team_name>
+```
