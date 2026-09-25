@@ -16,3 +16,4 @@ student_resource/dataset/
 dataset/
 output/
 .DS_Store
+*.zip
