@@ -9,12 +9,15 @@ import joblib
 
 warnings.filterwarnings('ignore', category=UserWarning)
 
-DATA_DIR = 'dataset'
-OUTPUT_DIR = 'output'
-MODEL_PATH = 'experiments/models/lgbm_5fold_models.pkl'
+# Override via env vars on Colab, e.g. DATA_DIR=/content/dataset after copying off Google Drive.
+DATA_DIR = os.environ.get('DATA_DIR', 'dataset')
+OUTPUT_DIR = os.environ.get('OUTPUT_DIR', 'output')
+MODEL_PATH = os.environ.get('MODEL_PATH', 'experiments/models/lgbm_5fold_models.pkl')
+CKPT_DIR = os.environ.get('CKPT_DIR', 'experiments/checkpoints')
 THRESHOLD = 0.55
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(CKPT_DIR, exist_ok=True)
 
 # 1. Normalization Rules
 LEGAL_SUFFIXES = {
@@ -207,15 +210,26 @@ def main():
     all_s1_ids = df_s1_test['entity_id'].tolist()
     print(f"Total required test S1 entities: {len(all_s1_ids):,}")
 
-    # Initialize results mapping
-    final_matches = {s1_id: [] for s1_id in all_s1_ids}
-    final_candidates = {s1_id: [] for s1_id in all_s1_ids}
+    # Initialize results mapping (or resume from a previous interrupted run so a Colab
+    # disconnect during a many-hour job doesn't throw away already-finished countries).
+    ckpt_path = f'{CKPT_DIR}/test_inference_progress.pkl'
+    done_countries = set()
+    if os.path.exists(ckpt_path):
+        ckpt = joblib.load(ckpt_path)
+        final_matches, final_candidates, done_countries = ckpt['final_matches'], ckpt['final_candidates'], ckpt['done_countries']
+        print(f"Resuming from checkpoint: {len(done_countries)} countries already completed ({sorted(done_countries)})")
+    else:
+        final_matches = {s1_id: [] for s1_id in all_s1_ids}
+        final_candidates = {s1_id: [] for s1_id in all_s1_ids}
 
     # Group by country dynamically
     countries = df_s1_test['country'].unique()
     print(f"Test countries discovered: {list(countries)}")
 
     for country in countries:
+        if country in done_countries:
+            print(f"\n>>> Skipping Country [{country}] (already completed in checkpoint) <<<")
+            continue
         print(f"\n>>> Processing Country [{country}] <<<")
         s1_c = df_s1_test[df_s1_test['country'] == country].copy().reset_index(drop=True)
         print(f"  Reference S1 entities in {country}: {len(s1_c):,}")
@@ -313,6 +327,10 @@ def main():
             for s1_id, c_id in zip(deduped['source1_entity_id'], deduped['cand_entity_id']):
                 final_matches[s1_id].append(c_id)
             print(f"  Matches assigned for {country}: {len(deduped):,}")
+
+        done_countries.add(country)
+        joblib.dump({'final_matches': final_matches, 'final_candidates': final_candidates, 'done_countries': done_countries}, ckpt_path)
+        print(f"  Checkpoint saved ({len(done_countries)}/{len(countries)} countries done)")
 
         del s1_c, s23_c, X_cand_name, X_cand_addr, vec_name, vec_addr, country_scored_pairs
         gc.collect()

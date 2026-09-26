@@ -11,9 +11,15 @@ import joblib
 
 warnings.filterwarnings('ignore', category=UserWarning)
 
-DATA_DIR = 'dataset'
-OUTPUT_DIR = 'output'
+# DATA_DIR/CKPT_DIR can be overridden with env vars so this runs unmodified on Colab
+# (e.g. `DATA_DIR=/content/dataset` after copying the dataset off Google Drive onto local disk).
+DATA_DIR = os.environ.get('DATA_DIR', 'dataset')
+OUTPUT_DIR = os.environ.get('OUTPUT_DIR', 'output')
+CKPT_DIR = os.environ.get('CKPT_DIR', 'experiments/checkpoints')
+VAL_SAMPLE_SIZE = int(os.environ.get('VAL_SAMPLE_SIZE', 50000))
 os.makedirs('experiments/models', exist_ok=True)
+os.makedirs(CKPT_DIR, exist_ok=True)
+t_run_start = time.time()
 
 # 1. Universal Country-Agnostic Normalizer
 LEGAL_SUFFIXES = {
@@ -128,25 +134,24 @@ def preprocess_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df['country'] = df['country'].fillna('UNKNOWN').astype(str).str.strip()
     return df
 
-# 2. Load 50,000 Record Validation Split
+# 2. Load Validation Split (size controlled by VAL_SAMPLE_SIZE)
 print("="*60)
-print("PHASE 1: Building 50,000-Record Holdout Validation Split")
+print(f"PHASE 1: Building {VAL_SAMPLE_SIZE:,}-Record Holdout Validation Split")
 print("="*60)
 t0 = time.time()
 gt_all = pd.read_csv(f'{DATA_DIR}/train/train_ground_truth.tsv', sep='\t')
-gt_sample = gt_all.head(50000).copy()
+gt_sample = gt_all.head(VAL_SAMPLE_SIZE).copy()
 
-gt_mapping = {}
-all_match_ids = set()
-for _, r in gt_sample.iterrows():
-    m = str(r['matched_entity_ids']) if pd.notna(r['matched_entity_ids']) else ''
-    s = set(x.strip() for x in m.split(',') if x.strip())
-    gt_mapping[r['source1_entity_id']] = s
-    all_match_ids.update(s)
+# Vectorized parse (was a 50k-row .iterrows() loop; this is >50x faster and scales to the full 2.2M-row file)
+match_lists = gt_sample['matched_entity_ids'].fillna('').astype(str).apply(
+    lambda m: [x.strip() for x in m.split(',') if x.strip()]
+)
+gt_mapping = dict(zip(gt_sample['source1_entity_id'], match_lists.apply(set)))
+all_match_ids = set().union(*match_lists) if len(match_lists) else set()
 
 target_s1_ids = set(gt_sample['source1_entity_id'])
 singletons_count = sum(1 for m in gt_mapping.values() if not m)
-print(f"50,000 S1 sample contains {len(all_match_ids):,} true match IDs across {len(gt_sample)-singletons_count:,} linked entities and {singletons_count:,} singletons ({singletons_count/len(gt_sample)*100:.2f}%)")
+print(f"{VAL_SAMPLE_SIZE:,} S1 sample contains {len(all_match_ids):,} true match IDs across {len(gt_sample)-singletons_count:,} linked entities and {singletons_count:,} singletons ({singletons_count/len(gt_sample)*100:.2f}%)")
 
 # S1 records
 s1_records = []
@@ -184,7 +189,9 @@ print(f"Validation pool loaded in {time.time()-t0:.2f}s: {len(val_s1):,} S1, {le
 print("\n" + "="*60)
 print("PHASE 2: Country-Partitioned Candidate Generation")
 print("="*60)
-def generate_candidates_for_country(s1_sub, s23_sub, top_n_name=45, thresh_name=0.20, top_n_addr=25, thresh_addr=0.25, max_total_cands=65):
+# Tuned to the validated faster/higher-recall config from notes.md (was 45/0.20, 25/0.25, cap 65,
+# which generates ~40% more candidate pairs than needed and slows every downstream phase).
+def generate_candidates_for_country(s1_sub, s23_sub, top_n_name=35, thresh_name=0.25, top_n_addr=20, thresh_addr=0.30, max_total_cands=50):
     if len(s1_sub) == 0 or len(s23_sub) == 0:
         return pd.DataFrame(columns=['s1_idx', 's23_idx', 'tfidf_name_sim', 'tfidf_addr_sim'])
     vec_name = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 4), min_df=2, max_features=50000, sublinear_tf=True, dtype=np.float32)
@@ -203,21 +210,31 @@ def generate_candidates_for_country(s1_sub, s23_sub, top_n_name=45, thresh_name=
     pairs = pd.concat([df_n, df_a], ignore_index=True)
     pairs = pairs.groupby(['s1_idx', 's23_idx'], as_index=False)[['tfidf_name_sim', 'tfidf_addr_sim']].max()
     pairs['max_sim'] = np.maximum(pairs['tfidf_name_sim'], pairs['tfidf_addr_sim'])
+    del vec_name, vec_addr, res_name, res_addr, coo_n, coo_a, df_n, df_a
     return pairs.sort_values(['s1_idx', 'max_sim'], ascending=[True, False]).groupby('s1_idx').head(max_total_cands).drop(columns=['max_sim']).reset_index(drop=True)
 
-candidate_pairs_list = []
-for country_val, s1_c in val_s1.groupby('country', sort=False):
-    s1_c = s1_c.reset_index(drop=True)
-    s23_c = val_s23[val_s23['country'] == country_val].reset_index(drop=True)
-    print(f"Blocking [{country_val}]: {len(s1_c):,} S1 entities against {len(s23_c):,} candidate records...")
-    t_blk = time.time()
-    cands_c = generate_candidates_for_country(s1_c, s23_c)
-    cands_c['source1_entity_id'] = s1_c.iloc[cands_c['s1_idx'].values]['entity_id'].values
-    cands_c['cand_entity_id'] = s23_c.iloc[cands_c['s23_idx'].values]['entity_id'].values
-    candidate_pairs_list.append(cands_c[['source1_entity_id', 'cand_entity_id', 'tfidf_name_sim', 'tfidf_addr_sim']])
-    print(f"  Generated {len(cands_c):,} pairs in {time.time()-t_blk:.2f}s")
+pairs_ckpt = f'{CKPT_DIR}/val_pairs_{VAL_SAMPLE_SIZE}.parquet'
+if os.path.exists(pairs_ckpt):
+    print(f"Found checkpoint, skipping blocking: {pairs_ckpt}")
+    val_pairs = pd.read_parquet(pairs_ckpt)
+else:
+    candidate_pairs_list = []
+    for country_val, s1_c in val_s1.groupby('country', sort=False):
+        s1_c = s1_c.reset_index(drop=True)
+        s23_c = val_s23[val_s23['country'] == country_val].reset_index(drop=True)
+        print(f"Blocking [{country_val}]: {len(s1_c):,} S1 entities against {len(s23_c):,} candidate records...")
+        t_blk = time.time()
+        cands_c = generate_candidates_for_country(s1_c, s23_c)
+        cands_c['source1_entity_id'] = s1_c.iloc[cands_c['s1_idx'].values]['entity_id'].values
+        cands_c['cand_entity_id'] = s23_c.iloc[cands_c['s23_idx'].values]['entity_id'].values
+        candidate_pairs_list.append(cands_c[['source1_entity_id', 'cand_entity_id', 'tfidf_name_sim', 'tfidf_addr_sim']])
+        print(f"  Generated {len(cands_c):,} pairs in {time.time()-t_blk:.2f}s")
+        del s1_c, s23_c, cands_c
+        gc.collect()
 
-val_pairs = pd.concat(candidate_pairs_list, ignore_index=True)
+    val_pairs = pd.concat(candidate_pairs_list, ignore_index=True)
+    val_pairs.to_parquet(pairs_ckpt)
+    print(f"Checkpoint saved: {pairs_ckpt}")
 print(f"Total candidate pairs: {len(val_pairs):,}")
 
 # Blocking Recall
@@ -376,7 +393,7 @@ for t in [0.40, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.82, 0.85, 0.88, 0.90
         best_f05, best_t, best_p, best_r = f05, t, p, r
 
 print("\n" + "="*60)
-print(f"FINAL 50,000-RECORD HOLDOUT RESULTS")
+print(f"FINAL {VAL_SAMPLE_SIZE:,}-RECORD HOLDOUT RESULTS")
 print("="*60)
 print(f"Optimal Threshold: {best_t:.2f}")
 print(f"Macro F0.5 Score:  {best_f05:.4f} ({best_f05*100:.2f}%)")
@@ -384,4 +401,5 @@ print(f"Macro Precision:   {best_p:.4f} ({best_p*100:.2f}%)")
 print(f"Macro Recall:      {best_r:.4f} ({best_r*100:.2f}%)")
 print(f"Blocking Recall:   {blocking_recall:.4f} ({blocking_recall*100:.2f}%)")
 print(f"Gate Target (>= 98%): {'PASSED' if best_f05 >= 0.98 else 'FAILED'}")
+print(f"Total wall-clock time: {(time.time()-t_run_start)/60:.1f} min")
 print("="*60)
