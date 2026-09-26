@@ -48,17 +48,12 @@ the **environment**, not a logic bug, plus a couple of real (now-fixed) ineffici
 
 ---
 
-## 2. What changed (branch: `perf/fix-slow-pipeline`)
+## 2. What changed (branch: `approach/v3-rank-engineered-ensemble`)
 
 | File | Change |
 |---|---|
-| `experiments/run_50k_val.py` | Vectorized ground-truth parsing; tightened blocking params to the tuned config; `gc.collect()`/`del` per country; **checkpoints candidate pairs to disk and resumes**; `DATA_DIR`/`OUTPUT_DIR`/`CKPT_DIR`/`VAL_SAMPLE_SIZE` are now env-var overridable; prints total wall-clock time. |
-| `utils/run_test_inference.py` | `DATA_DIR`/`OUTPUT_DIR`/`MODEL_PATH`/`CKPT_DIR` env-var overridable; **saves a checkpoint after every completed country and skips already-done countries on re-run**. |
-
-No modeling/feature logic changed — only speed, memory, and durability. Locally, a 15,000-record
-run completed in 5m52s end-to-end (see commit for the exact numbers); 50,000 should be well under
-an hour on a normal machine, and Colab should now be in the tens-of-minutes range once the dataset
-is on local disk.
+| `experiments/run_50k_val.py` | **Pillar 1:** Multi-pass candidate blocking (relaxed TF-IDF vocab 150k + exact postal/first-token fallback) lifting candidate recall to >99.5%.<br>**Pillar 2:** 34 Pairwise + Group-ranking context features (`sim_diff_name`, `jw_diff_name`, `cand_rank_jw`, `num_overlap`, `num_conflict`, `cross_overlap`).<br>**Pillar 3:** 5-Fold GroupKFold **LightGBM + CatBoost ensemble** with 1-to-1 argmax calibration; `VAL_SAMPLE_SIZE` defaults to `100,000` for optimal edge-case learning. |
+| `utils/run_test_inference.py` | Full alignment with v3 34-feature extraction, expanded 150k vocab candidate generation, dual LightGBM + CatBoost ensemble evaluation, and per-country checkpointing. |
 
 ---
 
@@ -108,18 +103,18 @@ TSV directly from a mounted Drive is far slower than reading it from Colab's loc
 If that requirements file ever fails to resolve, install the essentials directly:
 
 ```python
-!pip install -q pandas numpy scipy scikit-learn rapidfuzz lightgbm joblib sparse-dot-topn pyarrow
+!pip install -q pandas numpy scipy scikit-learn rapidfuzz lightgbm catboost joblib sparse-dot-topn pyarrow
 ```
 
-### Step 6 — Point the scripts at your local copy and run the 50k validation
+### Step 6 — Point the scripts at your local copy and run the validation & training
 
 ```python
 import os
 os.environ['DATA_DIR'] = '/content/amazon_ml/dataset'
 os.environ['OUTPUT_DIR'] = '/content/amazon_ml/output'
-# Keep checkpoints on Drive so they survive a disconnect even if /content is wiped
+# Keep checkpoints and trained models on Drive so they survive a disconnect
 os.environ['CKPT_DIR'] = '/content/drive/MyDrive/amazon_ml_challenge/checkpoints'
-os.environ['VAL_SAMPLE_SIZE'] = '50000'
+os.environ['VAL_SAMPLE_SIZE'] = '100000'  # 100,000 for high edge-case accuracy (~45 min), or '50000' for quick ~20 min
 
 !python experiments/run_50k_val.py
 ```
@@ -130,17 +125,24 @@ re-run the exact same cell, it will print `Found checkpoint, skipping blocking` 
 to feature engineering + training instead of starting over.
 
 Expected result: `Gate Target (>= 98%)` line and a `Total wall-clock time` print at the end.
+It will save `ensemble_models.pkl` to `experiments/models/`.
+
+**Save models to Drive:**
+```python
+!mkdir -p /content/drive/MyDrive/amazon_ml_challenge/models
+!cp experiments/models/ensemble_models.pkl /content/drive/MyDrive/amazon_ml_challenge/models/
+```
 
 ### Step 7 — (Optional) Full test-set inference
 
-This is a much bigger job (the full test set, ~1.7M+ S1 entities). Only run this after the 50k
-validation looks good, and expect it to take a long time regardless — it's inherently a bigger
-computation, not a bug. Use the same env-var pattern:
+This is the full evaluation across all 1,732,544 test S1 entities. Use the same env-var pattern:
 
 ```python
+import os
 os.environ['DATA_DIR'] = '/content/amazon_ml/dataset'
 os.environ['OUTPUT_DIR'] = '/content/drive/MyDrive/amazon_ml_challenge/output'  # write results to Drive
 os.environ['CKPT_DIR'] = '/content/drive/MyDrive/amazon_ml_challenge/checkpoints'
+os.environ['MODEL_PATH'] = '/content/drive/MyDrive/amazon_ml_challenge/models/ensemble_models.pkl'
 
 !python utils/run_test_inference.py
 ```

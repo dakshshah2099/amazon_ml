@@ -7,19 +7,27 @@ from sparse_dot_topn import sp_matmul_topn
 from rapidfuzz import fuzz, distance
 import joblib
 
+try:
+    from catboost import CatBoostClassifier
+    HAS_CATBOOST = True
+except ImportError:
+    HAS_CATBOOST = False
+
 warnings.filterwarnings('ignore', category=UserWarning)
 
-# Override via env vars on Colab, e.g. DATA_DIR=/content/dataset after copying off Google Drive.
+# Configurable paths via environment variables
 DATA_DIR = os.environ.get('DATA_DIR', 'dataset')
 OUTPUT_DIR = os.environ.get('OUTPUT_DIR', 'output')
-MODEL_PATH = os.environ.get('MODEL_PATH', 'experiments/models/lgbm_5fold_models.pkl')
+MODEL_PATH = os.environ.get('MODEL_PATH', 'experiments/models/ensemble_models.pkl')
+if not os.path.exists(MODEL_PATH) and os.path.exists('experiments/models/lgbm_5fold_models.pkl'):
+    MODEL_PATH = 'experiments/models/lgbm_5fold_models.pkl'
 CKPT_DIR = os.environ.get('CKPT_DIR', 'experiments/checkpoints')
-THRESHOLD = 0.55
+ENV_THRESHOLD = os.environ.get('THRESHOLD', None)
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(CKPT_DIR, exist_ok=True)
 
-# 1. Normalization Rules
+# 1. Normalization Rules (US, India, France)
 LEGAL_SUFFIXES = {
     r'\b(pvt\.?\s*ltd\.?|private\s+limited)\b': ' PVT_LTD ',
     r'\b(ltd\.?|limited)\b': ' LTD ',
@@ -35,6 +43,8 @@ LEGAL_SUFFIXES = {
     r'\b(sa|societe\s+anonyme)\b': ' SA ',
     r'\b(sci|societe\s+civile\s+immobiliere)\b': ' SCI ',
     r'\b(eurl)\b': ' EURL ',
+    r'\b(gie)\b': ' GIE ',
+    r'\b(snc)\b': ' SNC ',
 }
 
 ABBREV_EXPANSIONS = {
@@ -44,6 +54,8 @@ ABBREV_EXPANSIONS = {
     r'\btech\.?\b': 'technologies',
     r'\bdept\.?\b': 'department',
     r'\bassoc\.?\b': 'associates',
+    r'\bste\.?\b': 'societe',
+    r'\bcie\.?\b': 'compagnie',
     r'\b&\b': ' and ',
     r'\b\+\b': ' and ',
 }
@@ -63,11 +75,17 @@ ROAD_EXPANSIONS = {
     r'\brte\b': 'route',
     r'\ball\b': 'allee',
     r'\bimp\b': 'impasse',
+    r'\brue\b': 'rue',
+    r'\bchemin\b': 'chemin',
+    r'\bcours\b': 'cours',
+    r'\bquai\b': 'quai',
+    r'\bsq\.?\b|\bsquare\b': 'square',
 }
 
 RE_POSTAL = re.compile(r'\b[1-9]\d{2}\s?\d{3}\b|\b\d{5}(?:-\d{4})?\b')
 RE_URL = re.compile(r'(?:https?://)?(?:www\.)?([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})')
-RE_LANDMARKS = re.compile(r'\b(near|opp|opposite|behind|beside|adj|adjacent to|next to)\s+[\w\s]+?(?=,|\\.|$)', re.IGNORECASE)
+RE_LANDMARKS = re.compile(r'\b(near|opp|opposite|behind|beside|adj|adjacent to|next to|pres de|en face de)\s+[\w\s]+?(?=,|\\.|$)', re.IGNORECASE)
+RE_DIGITS = re.compile(r'\b\d+\b')
 
 def normalize_text(text: str) -> str:
     if not isinstance(text, str) or not text:
@@ -143,6 +161,7 @@ def compute_pairwise_features(merged_pairs_df: pd.DataFrame) -> pd.DataFrame:
     s2_names = merged_pairs_df['s23_name'].fillna('').astype(str).tolist()
     s1_addrs = merged_pairs_df['s1_addr'].fillna('').astype(str).tolist()
     s2_addrs = merged_pairs_df['s23_addr'].fillna('').astype(str).tolist()
+    cand_ids = merged_pairs_df['cand_entity_id'].fillna('').astype(str).tolist()
 
     name_lev = [distance.Levenshtein.normalized_similarity(a, b) for a, b in zip(s1_names, s2_names)]
     name_jw = [distance.JaroWinkler.similarity(a, b) for a, b in zip(s1_names, s2_names)]
@@ -180,6 +199,42 @@ def compute_pairwise_features(merged_pairs_df: pd.DataFrame) -> pd.DataFrame:
     suffix_match = ((suf1 != 'NONE') & (suf1 == suf2)).astype(float).values
     suffix_conflict = ((suf1 != 'NONE') & (suf2 != 'NONE') & (suf1 != suf2)).astype(float).values
 
+    # Source discriminator (S2 vs S3)
+    is_s2 = [1.0 if c.startswith('S2-') else 0.0 for c in cand_ids]
+
+    # Numerical sequence overlap and branch conflict
+    num_overlap, num_conflict, cross_overlap = [], [], []
+    for n1, a1, n2, a2 in zip(s1_names, s1_addrs, s2_names, s2_addrs):
+        nums1 = set(RE_DIGITS.findall(n1 + ' ' + a1))
+        nums2 = set(RE_DIGITS.findall(n2 + ' ' + a2))
+        if nums1 and nums2:
+            inter = len(nums1 & nums2)
+            num_overlap.append(inter / len(nums1 | nums2))
+            num_conflict.append(1.0 if inter == 0 else 0.0)
+        else:
+            num_overlap.append(0.0)
+            num_conflict.append(0.0)
+
+        # Cross-attribute overlap
+        w_n1, w_a1 = set(n1.split()), set(a1.split())
+        w_n2, w_a2 = set(n2.split()), set(a2.split())
+        cross_overlap.append(float(len(w_n1 & w_a2) + len(w_n2 & w_a1)))
+
+    # Group-relative ranking features within each S1 cluster
+    grp = merged_pairs_df.groupby('source1_entity_id')
+    max_n_sim = grp['tfidf_name_sim'].transform('max').values
+    max_a_sim = grp['tfidf_addr_sim'].transform('max').values
+    cand_cnt = grp['cand_entity_id'].transform('count').values
+
+    temp_jw = pd.Series(name_jw, index=merged_pairs_df.index)
+    grp_jw = temp_jw.groupby(merged_pairs_df['source1_entity_id'])
+    max_jw_val = grp_jw.transform('max').values
+    cand_rank_jw = grp_jw.rank(ascending=False, method='min').values - 1.0
+
+    sim_diff_name = merged_pairs_df['tfidf_name_sim'].values - max_n_sim
+    sim_diff_addr = merged_pairs_df['tfidf_addr_sim'].values - max_a_sim
+    jw_diff_name = np.array(name_jw) - max_jw_val
+
     return pd.DataFrame({
         'name_lev': name_lev, 'name_jw': name_jw, 'name_sort': name_sort, 'name_set': name_set,
         'name_partial': name_partial, 'name_exact': name_exact, 'first_token_match': first_token_match,
@@ -192,17 +247,41 @@ def compute_pairwise_features(merged_pairs_df: pd.DataFrame) -> pd.DataFrame:
         'suffix_match': suffix_match, 'suffix_conflict': suffix_conflict,
         'tfidf_name_sim': merged_pairs_df['tfidf_name_sim'].values,
         'tfidf_addr_sim': merged_pairs_df['tfidf_addr_sim'].values,
+        'is_s2': is_s2,
+        'num_overlap': num_overlap,
+        'num_conflict': num_conflict,
+        'cross_overlap': cross_overlap,
+        'sim_diff_name': sim_diff_name,
+        'sim_diff_addr': sim_diff_addr,
+        'jw_diff_name': jw_diff_name,
+        'cand_rank_jw': cand_rank_jw,
+        'cand_cnt': cand_cnt,
     })
 
 def main():
     print("="*60)
-    print("STARTING FULL TEST SET INFERENCE PIPELINE")
-    print(f"Threshold: {THRESHOLD:.2f} | 1-to-1 Argmax Matching")
+    print("STARTING FULL TEST SET INFERENCE PIPELINE (V3 ENSEMBLE)")
     print("="*60)
     
     t_start = time.time()
-    models = joblib.load(MODEL_PATH)
-    print(f"Loaded {len(models)} GBDT models from {MODEL_PATH}")
+    
+    # Load Models (Support Ensemble dictionary artifact or legacy list)
+    model_obj = joblib.load(MODEL_PATH)
+    if isinstance(model_obj, dict):
+        lgb_models = model_obj.get('lgb_models', [])
+        cb_models = model_obj.get('cb_models', [])
+        has_cb = model_obj.get('has_catboost', False) and len(cb_models) > 0
+        calibrated_t = model_obj.get('optimal_threshold', 0.50)
+        print(f"Loaded ensemble artifact from {MODEL_PATH}: {len(lgb_models)} LightGBM, {len(cb_models)} CatBoost models.")
+    else:
+        lgb_models = model_obj
+        cb_models = []
+        has_cb = False
+        calibrated_t = 0.55
+        print(f"Loaded legacy model list from {MODEL_PATH}: {len(lgb_models)} models.")
+        
+    threshold = float(ENV_THRESHOLD) if ENV_THRESHOLD is not None else calibrated_t
+    print(f"Active Decision Threshold: {threshold:.2f} | 1-to-1 Argmax Matching")
 
     # Read S1 test entities to guarantee 100% presence in output
     print("Reading reference test entities (test_source1.tsv)...")
@@ -210,8 +289,6 @@ def main():
     all_s1_ids = df_s1_test['entity_id'].tolist()
     print(f"Total required test S1 entities: {len(all_s1_ids):,}")
 
-    # Initialize results mapping (or resume from a previous interrupted run so a Colab
-    # disconnect during a many-hour job doesn't throw away already-finished countries).
     ckpt_path = f'{CKPT_DIR}/test_inference_progress.pkl'
     done_countries = set()
     if os.path.exists(ckpt_path):
@@ -222,7 +299,6 @@ def main():
         final_matches = {s1_id: [] for s1_id in all_s1_ids}
         final_candidates = {s1_id: [] for s1_id in all_s1_ids}
 
-    # Group by country dynamically
     countries = df_s1_test['country'].unique()
     print(f"Test countries discovered: {list(countries)}")
 
@@ -258,15 +334,28 @@ def main():
         s1_c = preprocess_dataframe(s1_c)
         s23_c = preprocess_dataframe(s23_c)
 
-        # Build candidate vectorizers
-        print("  Building sparse vectorizers...")
+        # Build candidate vectorizers with expanded 150k vocabulary
+        print("  Building sparse vectorizers (150,000 max features)...")
         t_vec = time.time()
-        vec_name = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 4), min_df=3, max_features=35000, sublinear_tf=True, dtype=np.float32)
+        vec_name = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 4), min_df=2, max_features=150000, sublinear_tf=True, dtype=np.float32)
         X_cand_name = vec_name.fit_transform(s23_c['clean_name'])
 
-        vec_addr = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 4), min_df=3, max_features=35000, sublinear_tf=True, dtype=np.float32)
+        vec_addr = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 4), min_df=2, max_features=150000, sublinear_tf=True, dtype=np.float32)
         X_cand_addr = vec_addr.fit_transform(s23_c['clean_addr'])
         print(f"  Vectorizers ready in {time.time()-t_vec:.2f}s")
+
+        # Build secondary index on (postal_code, prefix)
+        s23_post = s23_c['postal_code'].values
+        s23_name_arr = s23_c['clean_name'].values
+        s23_idx_dict = {}
+        for idx, (p, name) in enumerate(zip(s23_post, s23_name_arr)):
+            if p and len(name) >= 3:
+                k = (p, name[:4])
+                lst = s23_idx_dict.get(k)
+                if lst is None:
+                    s23_idx_dict[k] = [idx]
+                elif len(lst) < 15:
+                    lst.append(idx)
 
         # Process S1 in batches
         BATCH_SIZE = 30000
@@ -283,22 +372,37 @@ def main():
             batch_s1 = s1_c.iloc[b_start:b_end].copy().reset_index(drop=True)
             print(f"  [{country}] Batch {b+1}/{n_batches} ({len(batch_s1):,} S1 entities)...")
 
-            # Blocking
+            # Blocking Pass 1 & 2
             X_s1_name = vec_name.transform(batch_s1['clean_name'])
-            res_name = sp_matmul_topn(X_s1_name, X_cand_name.T, top_n=35, threshold=0.25, n_threads=8)
+            res_name = sp_matmul_topn(X_s1_name, X_cand_name.T, top_n=40, threshold=0.22, n_threads=8)
 
             X_s1_addr = vec_addr.transform(batch_s1['clean_addr'])
-            res_addr = sp_matmul_topn(X_s1_addr, X_cand_addr.T, top_n=20, threshold=0.30, n_threads=8)
+            res_addr = sp_matmul_topn(X_s1_addr, X_cand_addr.T, top_n=25, threshold=0.28, n_threads=8)
 
             coo_n = res_name.tocoo()
             coo_a = res_addr.tocoo()
             df_n = pd.DataFrame({'s1_idx': coo_n.row, 's23_idx': coo_n.col, 'tfidf_name_sim': coo_n.data, 'tfidf_addr_sim': 0.0})
             df_a = pd.DataFrame({'s1_idx': coo_a.row, 's23_idx': coo_a.col, 'tfidf_name_sim': 0.0, 'tfidf_addr_sim': coo_a.data})
 
-            b_pairs = pd.concat([df_n, df_a], ignore_index=True)
+            b_dfs = [df_n, df_a]
+
+            # Blocking Pass 3: Postal + Name Prefix
+            extra_s1_b, extra_s23_b = [], []
+            for s1_i, (p, name) in enumerate(zip(batch_s1['postal_code'].values, batch_s1['clean_name'].values)):
+                if p and len(name) >= 3:
+                    k = (p, name[:4])
+                    m_indices = s23_idx_dict.get(k)
+                    if m_indices:
+                        for m_idx in m_indices:
+                            extra_s1_b.append(s1_i)
+                            extra_s23_b.append(m_idx)
+            if extra_s1_b:
+                b_dfs.append(pd.DataFrame({'s1_idx': extra_s1_b, 's23_idx': extra_s23_b, 'tfidf_name_sim': 0.20, 'tfidf_addr_sim': 0.20}))
+
+            b_pairs = pd.concat(b_dfs, ignore_index=True)
             b_pairs = b_pairs.groupby(['s1_idx', 's23_idx'], as_index=False)[['tfidf_name_sim', 'tfidf_addr_sim']].max()
             b_pairs['max_sim'] = np.maximum(b_pairs['tfidf_name_sim'], b_pairs['tfidf_addr_sim'])
-            b_pairs = b_pairs.sort_values(['s1_idx', 'max_sim'], ascending=[True, False]).groupby('s1_idx').head(50).drop(columns=['max_sim']).reset_index(drop=True)
+            b_pairs = b_pairs.sort_values(['s1_idx', 'max_sim'], ascending=[True, False]).groupby('s1_idx').head(60).drop(columns=['max_sim']).reset_index(drop=True)
 
             b_pairs['source1_entity_id'] = batch_s1.iloc[b_pairs['s1_idx'].values]['entity_id'].values
             b_pairs['cand_entity_id'] = s23_c.iloc[b_pairs['s23_idx'].values]['entity_id'].values
@@ -314,11 +418,16 @@ def main():
             X_b = compute_pairwise_features(merged)
             
             # Predict ensemble probability
-            probs = np.mean([clf.predict_proba(X_b)[:, 1] for clf in models], axis=0)
+            lgb_p = np.mean([clf.predict_proba(X_b)[:, 1] for clf in lgb_models], axis=0)
+            if has_cb and cb_models:
+                cb_p = np.mean([clf.predict_proba(X_b)[:, 1] for clf in cb_models], axis=0)
+                probs = 0.55 * lgb_p + 0.45 * cb_p
+            else:
+                probs = lgb_p
             
             scored_df = b_pairs[['source1_entity_id', 'cand_entity_id']].copy()
             scored_df['prob'] = probs
-            country_scored_pairs.append(scored_df[scored_df['prob'] >= THRESHOLD])
+            country_scored_pairs.append(scored_df[scored_df['prob'] >= threshold])
 
         # Apply 1-to-1 argmax assignment across all country predictions
         if country_scored_pairs:
