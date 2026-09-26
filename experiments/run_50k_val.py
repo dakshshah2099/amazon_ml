@@ -39,7 +39,7 @@ LEGAL_SUFFIXES = {
     r'\b(sarl|societe\s+a\s+responsabilite\s+limitee)\b': ' SARL ',
     r'\b(sas|societe\s+par\s+actions\s+simplifiee)\b': ' SAS ',
     r'\b(sasu)\b': ' SASU ',
-    r'\b(sa|societe\s+anonyme)\b': ' SA ',
+    r'\b(societe\s+anonyme)\b': ' SA ',
     r'\b(sci|societe\s+civile\s+immobiliere)\b': ' SCI ',
     r'\b(eurl)\b': ' EURL ',
     r'\b(gie)\b': ' GIE ',
@@ -72,7 +72,7 @@ ROAD_EXPANSIONS = {
     r'\bp\.?o\.?\s*box\b': 'pobox',
     r'\bbd\b|\bbvd\b': 'boulevard',
     r'\brte\b': 'route',
-    r'\ball\b': 'allee',
+    r'\ball[eé]e?\b': 'allee',
     r'\bimp\b': 'impasse',
     r'\brue\b': 'rue',
     r'\bchemin\b': 'chemin',
@@ -85,6 +85,7 @@ RE_POSTAL = re.compile(r'\b[1-9]\d{2}\s?\d{3}\b|\b\d{5}(?:-\d{4})?\b')
 RE_URL = re.compile(r'(?:https?://)?(?:www\.)?([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})')
 RE_LANDMARKS = re.compile(r'\b(near|opp|opposite|behind|beside|adj|adjacent to|next to|pres de|en face de)\s+[\w\s]+?(?=,|\\.|$)', re.IGNORECASE)
 RE_DIGITS = re.compile(r'\b\d+\b')
+N_THREADS = min(8, os.cpu_count() or 4)
 
 def normalize_text(text: str) -> str:
     if not isinstance(text, str) or not text:
@@ -155,6 +156,8 @@ def jaccard(a: str, b: str) -> float:
     u = wa | wb
     return len(wa & wb) / len(u) if u else 0.0
 
+CKPT_VERSION = 'v3'  # Version-tag checkpoints to avoid mixing with V2 results
+
 # 2. Load Validation Split (size controlled by VAL_SAMPLE_SIZE)
 print("="*60)
 print(f"PHASE 1: Building {VAL_SAMPLE_SIZE:,}-Record Holdout Validation Split")
@@ -191,15 +194,15 @@ for chunk in pd.read_csv(f'{DATA_DIR}/train/train_source2.tsv', sep='\t', chunks
     m_sub = chunk[chunk['entity_id'].isin(all_match_ids)]
     if len(m_sub):
         s2_records.append(m_sub)
-    if len(s2_records) < 3:
-        s2_records.append(chunk.head(40000))
+    if len(s2_records) < 5:
+        s2_records.append(chunk.head(80000))
 
 for chunk in pd.read_csv(f'{DATA_DIR}/train/train_source3.tsv', sep='\t', chunksize=500000):
     m_sub = chunk[chunk['entity_id'].isin(all_match_ids)]
     if len(m_sub):
         s3_records.append(m_sub)
-    if len(s3_records) < 3:
-        s3_records.append(chunk.head(40000))
+    if len(s3_records) < 5:
+        s3_records.append(chunk.head(80000))
 
 val_s23 = pd.concat(s2_records + s3_records, ignore_index=True).drop_duplicates('entity_id')
 val_s23 = preprocess_dataframe(val_s23)
@@ -215,15 +218,15 @@ def generate_candidates_for_country(s1_sub, s23_sub, top_n_name=40, thresh_name=
     if len(s1_sub) == 0 or len(s23_sub) == 0:
         return pd.DataFrame(columns=['s1_idx', 's23_idx', 'tfidf_name_sim', 'tfidf_addr_sim'])
     
-    # Pass 1: Name TF-IDF (relaxed vocabulary 150k for rare distinctive tokens)
+    # Pass 1: Name TF-IDF (fit on S23 only — consistent with inference vectorizer)
     vec_name = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 4), min_df=2, max_features=150000, sublinear_tf=True, dtype=np.float32)
-    vec_name.fit(pd.concat([s1_sub['clean_name'], s23_sub['clean_name']]))
-    res_name = sp_matmul_topn(vec_name.transform(s1_sub['clean_name']), vec_name.transform(s23_sub['clean_name']).T, top_n=top_n_name, threshold=thresh_name, n_threads=8)
+    vec_name.fit(s23_sub['clean_name'])
+    res_name = sp_matmul_topn(vec_name.transform(s1_sub['clean_name']), vec_name.transform(s23_sub['clean_name']).T, top_n=top_n_name, threshold=thresh_name, n_threads=N_THREADS)
     
     # Pass 2: Address TF-IDF
     vec_addr = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 4), min_df=2, max_features=150000, sublinear_tf=True, dtype=np.float32)
-    vec_addr.fit(pd.concat([s1_sub['clean_addr'], s23_sub['clean_addr']]))
-    res_addr = sp_matmul_topn(vec_addr.transform(s1_sub['clean_addr']), vec_addr.transform(s23_sub['clean_addr']).T, top_n=top_n_addr, threshold=thresh_addr, n_threads=8)
+    vec_addr.fit(s23_sub['clean_addr'])
+    res_addr = sp_matmul_topn(vec_addr.transform(s1_sub['clean_addr']), vec_addr.transform(s23_sub['clean_addr']).T, top_n=top_n_addr, threshold=thresh_addr, n_threads=N_THREADS)
     
     coo_n = res_name.tocoo()
     coo_a = res_addr.tocoo()
@@ -265,7 +268,7 @@ def generate_candidates_for_country(s1_sub, s23_sub, top_n_name=40, thresh_name=
     del vec_name, vec_addr, res_name, res_addr, coo_n, coo_a, df_n, df_a
     return pairs.sort_values(['s1_idx', 'max_sim'], ascending=[True, False]).groupby('s1_idx').head(max_total_cands).drop(columns=['max_sim']).reset_index(drop=True)
 
-pairs_ckpt = f'{CKPT_DIR}/val_pairs_{VAL_SAMPLE_SIZE}.parquet'
+pairs_ckpt = f'{CKPT_DIR}/val_pairs_{CKPT_VERSION}_{VAL_SAMPLE_SIZE}.parquet'
 if os.path.exists(pairs_ckpt):
     print(f"Found checkpoint, skipping blocking: {pairs_ckpt}")
     val_pairs = pd.read_parquet(pairs_ckpt)
@@ -307,7 +310,7 @@ t_fe = time.time()
 merged_pairs = val_pairs.merge(val_s1[['entity_id', *s1_cols.keys()]].rename(columns=s1_cols), left_on='source1_entity_id', right_on='entity_id').drop(columns=['entity_id'])
 merged_pairs = merged_pairs.merge(val_s23[['entity_id', *s23_cols.keys()]].rename(columns=s23_cols), left_on='cand_entity_id', right_on='entity_id').drop(columns=['entity_id'])
 
-def compute_all_features(merged_pairs_df: pd.DataFrame) -> pd.DataFrame:
+def compute_pairwise_features(merged_pairs_df: pd.DataFrame) -> pd.DataFrame:
     s1_names = merged_pairs_df['s1_name'].fillna('').astype(str).tolist()
     s2_names = merged_pairs_df['s23_name'].fillna('').astype(str).tolist()
     s1_addrs = merged_pairs_df['s1_addr'].fillna('').astype(str).tolist()
@@ -369,7 +372,9 @@ def compute_all_features(merged_pairs_df: pd.DataFrame) -> pd.DataFrame:
         # Cross-attribute overlap (City / Brand token appearing in opposite field)
         w_n1, w_a1 = set(n1.split()), set(a1.split())
         w_n2, w_a2 = set(n2.split()), set(a2.split())
-        cross_overlap.append(float(len(w_n1 & w_a2) + len(w_n2 & w_a1)))
+        raw_cross = len(w_n1 & w_a2) + len(w_n2 & w_a1)
+        total_words = len(w_n1) + len(w_a2) + len(w_n2) + len(w_a1)
+        cross_overlap.append(raw_cross / max(1, total_words))
 
     # Group-relative ranking features within each S1 cluster
     grp = merged_pairs_df.groupby('source1_entity_id')
@@ -409,7 +414,11 @@ def compute_all_features(merged_pairs_df: pd.DataFrame) -> pd.DataFrame:
         'cand_cnt': cand_cnt,
     })
 
-X_val = compute_all_features(merged_pairs)
+X_val = compute_pairwise_features(merged_pairs)
+
+# Free raw text columns no longer needed during training
+del merged_pairs['s1_name'], merged_pairs['s23_name'], merged_pairs['s1_addr'], merged_pairs['s23_addr']
+gc.collect()
 y_val = np.array([1 if c in gt_mapping.get(s1, set()) else 0 for s1, c in zip(merged_pairs['source1_entity_id'], merged_pairs['cand_entity_id'])])
 print(f"Extracted {len(X_val.columns)} features for {len(X_val):,} pairs in {time.time()-t_fe:.2f}s")
 print(f"Positives: {np.sum(y_val):,} ({np.mean(y_val)*100:.2f}%), Negatives: {len(y_val)-np.sum(y_val):,}")
@@ -429,7 +438,7 @@ lgb_params = {
     'learning_rate': 0.04, 'num_leaves': 45, 'max_depth': 7, 'min_child_samples': 30,
     'subsample': 0.85, 'colsample_bytree': 0.85,
     'scale_pos_weight': 2.5,
-    'verbose': -1, 'random_state': 42
+    'verbose': -1,
 }
 
 for fold, (trn_idx, val_idx) in enumerate(gkf.split(X_val, y_val, groups=groups)):
@@ -490,7 +499,7 @@ pairs_df = merged_pairs[['source1_entity_id', 'cand_entity_id']].copy()
 pairs_df['prob'] = oof_probs
 
 best_t, best_f05, best_p, best_r = 0.50, 0.0, 0.0, 0.0
-for t in [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]:
+for t in [0.35, 0.40, 0.42, 0.45, 0.48, 0.50, 0.52, 0.55, 0.58, 0.60, 0.65, 0.70, 0.75]:
     filtered = pairs_df[pairs_df['prob'] >= t].sort_values('prob', ascending=False)
     deduped = filtered.drop_duplicates('cand_entity_id')
     preds = {s1: set() for s1 in gt_mapping.keys()}

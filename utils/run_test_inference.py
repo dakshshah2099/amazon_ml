@@ -40,7 +40,7 @@ LEGAL_SUFFIXES = {
     r'\b(sarl|societe\s+a\s+responsabilite\s+limitee)\b': ' SARL ',
     r'\b(sas|societe\s+par\s+actions\s+simplifiee)\b': ' SAS ',
     r'\b(sasu)\b': ' SASU ',
-    r'\b(sa|societe\s+anonyme)\b': ' SA ',
+    r'\b(societe\s+anonyme)\b': ' SA ',
     r'\b(sci|societe\s+civile\s+immobiliere)\b': ' SCI ',
     r'\b(eurl)\b': ' EURL ',
     r'\b(gie)\b': ' GIE ',
@@ -73,7 +73,7 @@ ROAD_EXPANSIONS = {
     r'\bp\.?o\.?\s*box\b': 'pobox',
     r'\bbd\b|\bbvd\b': 'boulevard',
     r'\brte\b': 'route',
-    r'\ball\b': 'allee',
+    r'\ball[eé]e?\b': 'allee',
     r'\bimp\b': 'impasse',
     r'\brue\b': 'rue',
     r'\bchemin\b': 'chemin',
@@ -86,6 +86,7 @@ RE_POSTAL = re.compile(r'\b[1-9]\d{2}\s?\d{3}\b|\b\d{5}(?:-\d{4})?\b')
 RE_URL = re.compile(r'(?:https?://)?(?:www\.)?([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})')
 RE_LANDMARKS = re.compile(r'\b(near|opp|opposite|behind|beside|adj|adjacent to|next to|pres de|en face de)\s+[\w\s]+?(?=,|\\.|$)', re.IGNORECASE)
 RE_DIGITS = re.compile(r'\b\d+\b')
+N_THREADS = min(8, os.cpu_count() or 4)
 
 def normalize_text(text: str) -> str:
     if not isinstance(text, str) or not text:
@@ -218,7 +219,9 @@ def compute_pairwise_features(merged_pairs_df: pd.DataFrame) -> pd.DataFrame:
         # Cross-attribute overlap
         w_n1, w_a1 = set(n1.split()), set(a1.split())
         w_n2, w_a2 = set(n2.split()), set(a2.split())
-        cross_overlap.append(float(len(w_n1 & w_a2) + len(w_n2 & w_a1)))
+        raw_cross = len(w_n1 & w_a2) + len(w_n2 & w_a1)
+        total_words = len(w_n1) + len(w_a2) + len(w_n2) + len(w_a1)
+        cross_overlap.append(raw_cross / max(1, total_words))
 
     # Group-relative ranking features within each S1 cluster
     grp = merged_pairs_df.groupby('source1_entity_id')
@@ -289,7 +292,7 @@ def main():
     all_s1_ids = df_s1_test['entity_id'].tolist()
     print(f"Total required test S1 entities: {len(all_s1_ids):,}")
 
-    ckpt_path = f'{CKPT_DIR}/test_inference_progress.pkl'
+    ckpt_path = f'{CKPT_DIR}/test_inference_progress_v3.pkl'
     done_countries = set()
     if os.path.exists(ckpt_path):
         ckpt = joblib.load(ckpt_path)
@@ -374,10 +377,10 @@ def main():
 
             # Blocking Pass 1 & 2
             X_s1_name = vec_name.transform(batch_s1['clean_name'])
-            res_name = sp_matmul_topn(X_s1_name, X_cand_name.T, top_n=40, threshold=0.22, n_threads=8)
+            res_name = sp_matmul_topn(X_s1_name, X_cand_name.T, top_n=40, threshold=0.22, n_threads=N_THREADS)
 
             X_s1_addr = vec_addr.transform(batch_s1['clean_addr'])
-            res_addr = sp_matmul_topn(X_s1_addr, X_cand_addr.T, top_n=25, threshold=0.28, n_threads=8)
+            res_addr = sp_matmul_topn(X_s1_addr, X_cand_addr.T, top_n=25, threshold=0.28, n_threads=N_THREADS)
 
             coo_n = res_name.tocoo()
             coo_a = res_addr.tocoo()
