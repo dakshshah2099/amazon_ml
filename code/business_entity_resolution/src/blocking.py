@@ -255,15 +255,13 @@ def run_blocking(
                 f_part.flush()
                 buf = []
 
-            # Purge dense search data from RAM/VRAM
+            # Free GPU VRAM immediately; keep src_c_emb in system RAM for fast Stage 2 lookups
             if use_gpu:
                 del cand_gpu
                 torch.cuda.empty_cache()
             else:
                 del index
-            del src_c_emb
-            gc.collect()
-            log(f"    [Dense {'GPU' if use_gpu else 'FAISS'} Complete] Freed candidate embeddings. Intermediate pairs so far: {country_pairs:,}")
+            log(f"    [Dense {'GPU' if use_gpu else 'FAISS'} Complete] Intermediate pairs so far: {country_pairs:,}")
 
             # -------------------------------------------------------------
             # STAGE 2: Inverted Index Lexical Blocking (Channel 2)
@@ -314,8 +312,7 @@ def run_blocking(
                 if new_cand_indices:
                     s1_vec = s1_c_emb[q_idx]
                     for c_idx in new_cand_indices:
-                        c_global_idx = src_c_indices[c_idx]
-                        c_vec = emb_src[c_global_idx]  # on-demand mmap disk access
+                        c_vec = src_c_emb[c_idx]  # In-RAM lookup (0 nanoseconds, zero disk IOPS)
                         sc = float(np.dot(s1_vec, c_vec))
                         c_id = src_c_ids[c_idx]
                         buf.append(f"{s1_id}\t{c_id}\t{source_name}\t{sc:.5f}\n")
@@ -329,6 +326,10 @@ def run_blocking(
                     f_part.flush()
                     buf = []
 
+                if (q_idx + 1) % 100_000 == 0 or (q_idx + 1) == len(s1_c_ids):
+                    pct = ((q_idx + 1) / len(s1_c_ids)) * 100
+                    log(f"    [Inverted Index | {country}] {q_idx + 1:,}/{len(s1_c_ids):,} ({pct:.1f}%) queries processed (+{c2_country_added:,} pairs added)...")
+
             if buf:
                 f_part.writelines(buf)
                 f_part.flush()
@@ -339,7 +340,7 @@ def run_blocking(
                 f_d.write(f"{country_pairs}\n")
             log(f"  [Checkpoint Written] Flushed {country_pairs:,} pairs to {part_file} and marked done.")
 
-            del inv_index, df_src_c, seen_cands_map, s1_names, s1_addrs, s1_pcs, s1_c_ids, s1_c_emb, df_s1_c
+            del inv_index, df_src_c, seen_cands_map, s1_names, s1_addrs, s1_pcs, s1_c_ids, s1_c_emb, df_s1_c, src_c_emb
             gc.collect()
 
         del src_country_arr, ids_src, emb_src
