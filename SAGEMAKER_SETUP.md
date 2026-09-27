@@ -30,8 +30,8 @@ pip install faiss-gpu-cu12 sentence-transformers torch --upgrade
 Upload your test data and trained sample/train models to S3 first from local:
 ```bash
 # In SageMaker terminal:
-aws s3 sync s3://<your-bucket>/dataset/test/ dataset/test/
-aws s3 sync s3://<your-bucket>/models/ models/
+aws s3 sync s3://amazon-ml-648426766204-ap-south-1/dataset/test/ dataset/test/
+aws s3 sync s3://amazon-ml-648426766204-ap-south-1/models/ models/
 ```
 
 ---
@@ -73,5 +73,5 @@ python code/business_entity_resolution/src/predict_matches.py \
 
 ### Step 5: Upload Results to S3
 ```bash
-aws s3 cp output/matching_results.tsv s3://<your-bucket>/submissions/matching_results.tsv
+aws s3 cp output/matching_results.tsv s3://amazon-ml-648426766204-ap-south-1/submissions/matching_results.tsv
 ```
