@@ -47,7 +47,7 @@ def _worker_extract_features(pairs_chunk):
     if features_list:
         X = np.array(features_list, dtype=np.float32)
     else:
-        X = np.empty((0, 30), dtype=np.float32)
+        X = np.empty((0, len(ALL_FEATURE_NAMES)), dtype=np.float32)
 
     return valid_pairs, X
 
@@ -64,7 +64,8 @@ def predict_matches(
     sample_s1=None,
     data_dir=None,
     prefix=None,
-    eval_gt_path=None
+    eval_gt_path=None,
+    threshold=None
 ):
     log("=" * 70)
     log(f"STAGE 5: INFERENCE ({split.upper()}) WITH NO INFERENCE-TIME PRE-FILTERING")
@@ -81,7 +82,8 @@ def predict_matches(
     log(f"Loading metadata from {meta_path}...")
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
-    threshold = float(meta['threshold'])
+    if threshold is None:
+        threshold = float(meta['threshold'])
     calibrator = meta.get('calibrator', None)
     log(f"Decision Threshold: {threshold:.4f} (Calibrator present: {calibrator is not None})")
     assert meta['features'] == ALL_FEATURE_NAMES, "Model features do not match ALL_FEATURE_NAMES!"
@@ -186,8 +188,13 @@ def predict_matches(
             if calibrator is not None:
                 avg_probs = calibrator.transform(avg_probs)
 
-            # Filter by threshold
-            match_mask = avg_probs >= threshold
+            # Precision safety guard: reject empty candidate addresses unless name is >= 95% identical
+            idx_cand_empty = ALL_FEATURE_NAMES.index('cand_addr_empty')
+            idx_name_ratio = ALL_FEATURE_NAMES.index('name_ratio')
+            empty_guard = ~((X_chunk[:, idx_cand_empty] == 1.0) & (X_chunk[:, idx_name_ratio] < 0.95))
+
+            # Filter by threshold with precision guard
+            match_mask = (avg_probs >= threshold) & empty_guard
             matched_indices = np.where(match_mask)[0]
 
             for idx in matched_indices:
@@ -294,6 +301,7 @@ if __name__ == '__main__':
     parser.add_argument('--workers', type=int, default=8)
     parser.add_argument('--sample-s1', type=int, default=None, help='Sample N S1 entities for rapid evaluation')
     parser.add_argument('--eval-gt', default=None, help='Ground truth TSV path to evaluate against')
+    parser.add_argument('--threshold', type=float, default=None, help='Decision threshold override')
     args = parser.parse_args()
     predict_matches(
         split=args.split,
@@ -305,6 +313,7 @@ if __name__ == '__main__':
         num_workers=args.workers,
         sample_s1=args.sample_s1,
         eval_gt_path=args.eval_gt,
+        threshold=args.threshold,
         data_dir=args.data_dir,
         prefix=args.prefix
     )

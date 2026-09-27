@@ -6,6 +6,26 @@ import rapidfuzz.fuzz as fuzz
 WORD_RE = re.compile(r'\b\w+\b')
 DIGIT_RE = re.compile(r'\b\d+\b')
 
+GEO_STOPS = {
+    'mumbai', 'delhi', 'kolkata', 'bangalore', 'bengaluru', 'hyderabad', 'chennai',
+    'pune', 'jaipur', 'ahmedabad', 'surat', 'indore', 'bhopal', 'lucknow', 'patna',
+    'kanpur', 'nagpur', 'thane', 'charlotte', 'indianapolis', 'dallas', 'houston',
+    'austin', 'seattle', 'portland', 'denver', 'phoenix', 'atlanta', 'boston',
+    'chicago', 'miami', 'orlando', 'detroit', 'minneapolis', 'cleveland', 'columbus',
+    'india', 'usa', 'america', 'american', 'california', 'texas', 'florida', 'york',
+    'washington', 'ohio', 'illinois', 'georgia', 'north', 'south', 'east', 'west'
+}
+
+CORP_STOPS = {
+    'the', 'a', 'an', 'and', '&', 'of', 'in', 'on', 'at', 'for', 'to',
+    'llc', 'inc', 'incorporated', 'corp', 'corporation', 'co', 'company',
+    'ltd', 'limited', 'pvt', 'private', 'group', 'services', 'enterprises',
+    'holdings', 'technologies', 'solutions', 'consulting', 'management',
+    'international', 'products', 'trading', 'industries', 'associates'
+}
+
+CORE_NAME_STOPS = CORP_STOPS | GEO_STOPS
+
 def extract_tokens(text):
     if not text:
         return set()
@@ -124,7 +144,25 @@ def compute_pair_features(s1_name, s1_addr, s1_pc, s2_name, s2_addr, s2_pc,
     # 27. Either side required transliteration — proxy for non-Latin-script
     # source data, which correlates with noisier address/name normalization
     either_needs_translit = 1.0 if (s1_needs_trans or s2_needs_trans) else 0.0
-        
+
+    # 28. Address number conflict (both specify numbers but have 0 overlap)
+    num_conflict = 1.0 if (s1_nums and s2_nums and not (s1_nums & s2_nums)) else 0.0
+
+    # 29. Candidate address is completely empty
+    cand_addr_empty = 1.0 if not s2_a else 0.0
+
+    # 30-31. Core name token overlap (excluding corporate and geo stopwords)
+    s1_core = {t.lower() for t in s1_n_toks if t.lower() not in CORE_NAME_STOPS and len(t) > 2}
+    s2_core = {t.lower() for t in s2_n_toks if t.lower() not in CORE_NAME_STOPS and len(t) > 2}
+    core_name_jaccard = jaccard_similarity(s1_core, s2_core)
+    core_name_exact = 1.0 if (s1_core and s1_core == s2_core) else 0.0
+
+    # 32. Space-collapsed exact name match
+    name_nospace_match = 1.0 if (s1_n and s1_n.replace(' ', '') == s2_n.replace(' ', '')) else 0.0
+
+    # 33. Harmonic mean of Name JW and Address Token Set Ratio (strictly penalizes single-attribute false positives)
+    name_addr_harmonic = (2.0 * name_jw * addr_token_set) / (name_jw + addr_token_set + 1e-6)
+
     return [
         name_ratio,
         name_partial_ratio,
@@ -152,7 +190,13 @@ def compute_pair_features(s1_name, s1_addr, s1_pc, s2_name, s2_addr, s2_pc,
         name_acronym_match,
         both_has_state,
         state_presence_mismatch,
-        either_needs_translit
+        either_needs_translit,
+        num_conflict,
+        cand_addr_empty,
+        core_name_jaccard,
+        core_name_exact,
+        name_nospace_match,
+        name_addr_harmonic
     ]
 
 FEATURE_NAMES = [
@@ -182,7 +226,13 @@ FEATURE_NAMES = [
     'name_acronym_match',
     'both_has_state',
     'state_presence_mismatch',
-    'either_needs_translit'
+    'either_needs_translit',
+    'num_conflict',
+    'cand_addr_empty',
+    'core_name_jaccard',
+    'core_name_exact',
+    'name_nospace_match',
+    'name_addr_harmonic'
 ]
 
 def compute_embedding_features(emb1, emb2):

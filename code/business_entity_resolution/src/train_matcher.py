@@ -156,7 +156,7 @@ def train_matcher(
     gc.collect()
 
     # 4. Feature Extraction
-    log("Extracting 30 features per pair...")
+    log(f"Extracting {len(ALL_FEATURE_NAMES)} features per pair...")
     X_list = []
     y_list = []
 
@@ -175,7 +175,7 @@ def train_matcher(
 
     X = np.array(X_list, dtype=np.float32)
     y = np.array(y_list, dtype=np.int32)
-    assert X.shape[1] == len(ALL_FEATURE_NAMES) == 30, f"Expected 30 features, got {X.shape[1]}"
+    assert X.shape[1] == len(ALL_FEATURE_NAMES), f"Expected {len(ALL_FEATURE_NAMES)} features, got {X.shape[1]}"
     log(f"Dataset matrix shape: X={X.shape}, y={y.shape}")
 
     # 5. Stratified 5-Fold Cross Validation
