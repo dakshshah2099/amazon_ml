@@ -21,6 +21,21 @@ POSTAL_CODE_REGEX = re.compile(r'\b\d{5,6}\b')
 LANDMARK_REGEX = re.compile(r'(?i)\b(near|opp\.?|opposite|behind)\s+[^,]+')
 WHITESPACE_REGEX = re.compile(r'\s+')
 
+# URL and Domain regexes for web entity normalization
+URL_PREFIX_REGEX = re.compile(r'(?i)\bhttps?:\/\/(?:www\.)?|\bwww\.')
+DOMAIN_TLD_REGEX = re.compile(r'(?i)\.(?:com|org|net|co\.in|gov|edu|mil|in|co|io|biz|info|ai|us|me|org\.in|net\.in)(?:\/.*)?\b')
+
+def strip_domain_and_url(text):
+    """
+    Strips URL schemes (http://, https://, www.) and top-level domain extensions (.com, .org, .in, etc.)
+    from entity names.
+    """
+    if not text:
+        return text
+    t = URL_PREFIX_REGEX.sub('', text)
+    t = DOMAIN_TLD_REGEX.sub('', t)
+    return t
+
 # Standard missing value sentinels (do not treat as valid business names/addresses)
 SENTINELS = {'', 'null', 'nan', 'none', 'n/a', 'na', 'undefined'}
 
@@ -168,6 +183,8 @@ def clean_record(raw_name, raw_addr):
             n = transliterate_if_needed(n)
         # Step 3
         n = n.lower()
+        # Domain and URL normalization
+        n = strip_domain_and_url(n)
         # Step 4
         n = PUNCT_STEP4_REGEX.sub(' ', n)
         # Step 5: Suffix expansion with attached punctuation support
@@ -232,6 +249,7 @@ def clean_for_embedding(raw_name, raw_addr):
         name_out = ''
     else:
         name_out = transliterate_if_needed(raw_name_str) if NON_LATIN_INDIC_REGEX.search(raw_name_str) else raw_name_str
+        name_out = strip_domain_and_url(name_out)
         name_out = WHITESPACE_REGEX.sub(' ', name_out).strip()
 
     if raw_addr_str.lower() in SENTINELS:

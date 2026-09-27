@@ -40,9 +40,12 @@ def extract_blocking_keys(name, addr, pc):
     addr_toks = [t for t in re.findall(r'\b[a-z]+\b', addr_str) if len(t) > 3 and t not in STOP_TOKENS and t not in ADDR_STRUCT_STOPS]
     addr_nums = re.findall(r'\b\d+[a-z]?\b', addr_str)
 
-    # 1. Exact clean name (if >= 4 chars)
+    # 1. Exact clean name (if >= 4 chars) and space-collapsed clean name
     if len(name_str) >= 4:
         keys.append(('ex_name', name_str))
+        n_ns = name_str.replace(' ', '')
+        if len(n_ns) >= 5:
+            keys.append(('ex_name_ns', n_ns))
 
     # 2. Exact clean address (if >= 8 chars)
     if len(addr_str) >= 8:
@@ -54,9 +57,11 @@ def extract_blocking_keys(name, addr, pc):
     elif len(name_toks) == 1:
         keys.append(('n_1tok', name_toks[0]))
 
-    # 4. Street number + first informative address token
+    # 4. Street number + informative address tokens (permutation-invariant across first 3 tokens)
     if addr_nums and addr_toks:
-        keys.append(('a_num_tok', f"{addr_nums[0]}_{addr_toks[0]}"))
+        for num in addr_nums[:2]:
+            for tok in addr_toks[:3]:
+                keys.append(('s_num_tok', f"{num}_{tok}"))
 
     # 5. Postal code + first name token
     if pc_str and name_toks:
@@ -77,6 +82,11 @@ def extract_blocking_keys(name, addr, pc):
     for t in name_toks:
         if len(t) >= 4:
             keys.append(('rare_tok', t))
+
+    # 9. Rare locality/street address tokens (len >= 5)
+    for t in addr_toks:
+        if len(t) >= 5:
+            keys.append(('rare_addr', t))
 
     return keys
 
