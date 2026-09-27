@@ -12,7 +12,6 @@ BUCKET="s3://amazon-ml-648426766204-ap-south-1"
 echo -e "\n>>> Step 1: Installing Requirements..."
 pip install --upgrade pip
 pip install -r code/business_entity_resolution/requirements.txt
-pip install faiss-cpu sentence-transformers torch --upgrade
 
 # 2. Sync Datasets and Trained Models from S3
 echo -e "\n>>> Step 2: Syncing test TSVs and models from S3..."
@@ -22,11 +21,11 @@ aws s3 sync ${BUCKET}/models/ models/
 
 # 3. Preprocess Test TSVs to Clean Parquet
 echo -e "\n>>> Step 3: Preprocessing test TSVs to clean Parquet..."
-python code/business_entity_resolution/src/preprocess.py --split test
+python code/business_entity_resolution/src/preprocess.py --split test --workers 4
 
-# 4. Generate Embeddings (Dense Semantic Representation)
-echo -e "\n>>> Step 4: Generating embeddings for test entities..."
-python code/business_entity_resolution/src/embed_entities.py --split test --batch-size 128
+# 4. Generate Embeddings (Dense Semantic Representation on GPU)
+echo -e "\n>>> Step 4: Generating embeddings for test entities on GPU..."
+python code/business_entity_resolution/src/embed_entities.py --split test --batch-size 256
 
 # 5. Hybrid Blocking (FAISS Exact + Multi-Key Inverted Index)
 echo -e "\n>>> Step 5: Running Hybrid Blocking..."
@@ -46,7 +45,8 @@ python code/business_entity_resolution/src/predict_matches.py \
   --model-cb models/cb_matcher.cbm \
   --meta models/matcher_metadata.pkl \
   --out output/matching_results.tsv \
-  --workers 8
+  --threshold 0.92 \
+  --workers 4
 
 # 7. Upload Submission TSV to S3
 echo -e "\n>>> Step 7: Uploading final submission to S3..."
@@ -59,5 +59,5 @@ echo "=========================================================="
 
 # 8. Auto-stop notebook instance to avoid compute charges
 echo -e "\n>>> Step 8: Auto-stopping notebook instance to avoid billing..."
-aws sagemaker stop-notebook-instance --notebook-instance-name amazon-ml-notebook || true
+aws sagemaker stop-notebook-instance --notebook-instance-name amazon-ml-gpu || true
 
