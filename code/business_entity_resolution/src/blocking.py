@@ -140,7 +140,7 @@ def run_blocking(
 
     import gc
 
-    # Process Candidate Sources sequentially to keep peak RAM well under 8 GB
+    # Process Candidate Sources sequentially to keep peak RAM well under 4 GB
     for source_name in ['source2', 'source3']:
         log("=" * 60)
         log(f"BLOCKING CANDIDATE SOURCE: {source_name.upper()}")
@@ -160,12 +160,6 @@ def run_blocking(
             s1_c_emb = np.ascontiguousarray(emb_s1[s1_mask], dtype=np.float32)
             df_s1_c = df_s1[s1_mask]
 
-            # Precompute keys for S1 queries
-            s1_keys_list = [
-                extract_blocking_keys(r.business_name_clean, r.business_address_clean, r.postal_code)
-                for r in df_s1_c.itertuples(index=False)
-            ]
-
             src_mask = (df_src['country'] == country).to_numpy()
             src_c_ids = ids_src[src_mask]
             src_c_emb = np.ascontiguousarray(emb_src[src_mask], dtype=np.float32)
@@ -175,18 +169,27 @@ def run_blocking(
                 log(f"  {source_name}: empty subset, skipping")
                 continue
 
-            log(f"  {source_name}: S1={len(s1_c_ids):,} vs {len(src_c_ids):,}")
+            log(f"  {source_name}: S1={len(s1_c_ids):,} vs Candidates={len(src_c_ids):,}")
 
             # 1. Build Inverted Index on Candidates (Channel 2)
-            src_id_to_idx = {cid: idx for idx, cid in enumerate(src_c_ids)}
-            inv_index = defaultdict(list)
-            for r in df_src_c.itertuples(index=False):
-                cid = r.entity_id
-                for k_type, k_val in extract_blocking_keys(r.business_name_clean, r.business_address_clean, r.postal_code):
-                    inv_index[(k_type, k_val)].append(cid)
-
-            # Filter inverted index buckets exceeding cap
-            inv_index = {k: v for k, v in inv_index.items() if len(v) <= max_bucket_size}
+            # Memory-Safe: Store integer indices (4 bytes) instead of string IDs (60 bytes)
+            # Instant Pruning: Discard buckets immediately once exceeding max_bucket_size
+            inv_index = {}
+            oversized_keys = set()
+            for c_idx, r in enumerate(df_src_c.itertuples(index=False)):
+                for key in extract_blocking_keys(r.business_name_clean, r.business_address_clean, r.postal_code):
+                    if key in oversized_keys:
+                        continue
+                    bucket = inv_index.get(key)
+                    if bucket is None:
+                        inv_index[key] = [c_idx]
+                    elif len(bucket) < max_bucket_size:
+                        bucket.append(c_idx)
+                    else:
+                        del inv_index[key]
+                        oversized_keys.add(key)
+            del oversized_keys
+            log(f"  Built inverted index with {len(inv_index):,} active buckets (capped at <= {max_bucket_size} entries).")
 
             # 2. Build FAISS Index (Channel 1)
             dim = src_c_emb.shape[1]
@@ -202,14 +205,19 @@ def run_blocking(
                 log(f"  Using exact IndexFlatIP search")
 
             k_val = min(k, index.ntotal)
-            batch_size = 20000
+            batch_size = 5000  # Smaller batch prevents distance matrix memory spikes in OpenMP
             buf = []
             total_q_batches = (len(s1_c_emb) + batch_size - 1) // batch_size
 
+            # Stream queries in small batches, computing blocking keys on the fly
+            s1_records_tuples = df_s1_c.itertuples(index=False)
+            df_rows = list(s1_records_tuples)
+
             for batch_idx, q_start in enumerate(range(0, len(s1_c_emb), batch_size), 1):
                 q_end = min(q_start + batch_size, len(s1_c_emb))
-                if batch_idx % 2 == 1 or q_end == len(s1_c_emb):
+                if batch_idx % 4 == 1 or q_end == len(s1_c_emb):
                     log(f"  [{country} | {source_name.upper()}] Batch {batch_idx}/{total_q_batches} ({q_end:,}/{len(s1_c_emb):,} queries, {total_pairs:,} total candidate pairs so far)...")
+                
                 scores, indices = index.search(s1_c_emb[q_start:q_end], k_val)
 
                 for i in range(indices.shape[0]):
@@ -227,23 +235,22 @@ def run_blocking(
                         if idx < 0:
                             continue
                         c_id = src_c_ids[idx]
-                        seen_cands.add(c_id)
+                        seen_cands.add(idx)
                         buf.append(f"{s1_id}\t{c_id}\t{source_name}\t{sc:.5f}\n")
-                        contest_cands[s1_id].add(c_id)
                         total_pairs += 1
                         channel1_pairs += 1
 
-                    # Channel 2: Complementary Lexical / Address Inverted Index
-                    for key in s1_keys_list[global_q_idx]:
+                    # Channel 2: Inverted Index (keys computed on-the-fly per record)
+                    r = df_rows[global_q_idx]
+                    for key in extract_blocking_keys(r.business_name_clean, r.business_address_clean, r.postal_code):
                         bucket = inv_index.get(key)
                         if bucket:
-                            for c_id in bucket:
-                                if c_id not in seen_cands:
-                                    seen_cands.add(c_id)
-                                    c_idx = src_id_to_idx[c_id]
+                            for c_idx in bucket:
+                                if c_idx not in seen_cands:
+                                    seen_cands.add(c_idx)
+                                    c_id = src_c_ids[c_idx]
                                     sc = float(np.dot(s1_vec, src_c_emb[c_idx]))
                                     buf.append(f"{s1_id}\t{c_id}\t{source_name}\t{sc:.5f}\n")
-                                    contest_cands[s1_id].add(c_id)
                                     total_pairs += 1
                                     channel2_added_pairs += 1
 
@@ -254,7 +261,7 @@ def run_blocking(
             if buf:
                 f_detailed.writelines(buf)
 
-            del index, inv_index, src_id_to_idx, src_c_ids, src_c_emb, s1_c_ids, s1_c_emb, df_s1_c, df_src_c, s1_keys_list
+            del index, inv_index, src_c_ids, src_c_emb, s1_c_ids, s1_c_emb, df_s1_c, df_src_c, df_rows
             gc.collect()
             log(f"  Done [{country} | {source_name.upper()}]. Running total pairs: {total_pairs:,} (FAISS={channel1_pairs:,}, InvertedIndex=+{channel2_added_pairs:,})")
 
@@ -265,16 +272,27 @@ def run_blocking(
     log(f"Saved {detailed_file} ({total_pairs:,} total pairs)")
 
     final_cand_file = os.path.join(out_dir, f"{split}_candidate_pairs.tsv" if split == 'train' else "candidate_pairs.tsv")
+    log(f"Writing {final_cand_file} from detailed candidate pairs...")
+    cand_agg = defaultdict(set)
+    with open(detailed_file, 'r', encoding='utf-8') as f_det:
+        next(f_det, None)
+        for line in f_det:
+            pts = line.split('\t')
+            if len(pts) >= 2:
+                cand_agg[pts[0]].add(pts[1])
+
     with open(final_cand_file, 'w', encoding='utf-8') as f_cand:
         f_cand.write("source1_entity_id\tcandidate_entity_ids\n")
         buf = []
         for s1_id in df_s1['entity_id']:
-            buf.append(f"{s1_id}\t{','.join(contest_cands.get(s1_id, set()))}\n")
+            buf.append(f"{s1_id}\t{','.join(cand_agg.get(s1_id, set()))}\n")
             if len(buf) >= 100000:
                 f_cand.writelines(buf)
                 buf = []
         if buf:
             f_cand.writelines(buf)
+    del cand_agg
+    gc.collect()
     log(f"Saved {final_cand_file}")
 
 # Backward-compat alias
