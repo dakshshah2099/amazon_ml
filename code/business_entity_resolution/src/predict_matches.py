@@ -78,7 +78,7 @@ def predict_matches(
     prefix=None,
     eval_gt_path=None,
     threshold=None,
-    min_cand_score=0.62
+    min_cand_score=0.70
 ):
     log("=" * 70)
     log(f"STAGE 5: INFERENCE ({split.upper()}) | min_cand_score={min_cand_score}")
@@ -165,9 +165,7 @@ def predict_matches(
         )):
             raw_lines_scanned += len(chunk)
             if min_cand_score is not None and min_cand_score > 0.0:
-                is_lexical = (chunk['embed_score'] >= 0.54999) & (chunk['embed_score'] <= 0.55001)
-                keep_mask = is_lexical | (chunk['embed_score'] >= min_cand_score)
-                chunk = chunk[keep_mask]
+                chunk = chunk[chunk['embed_score'] >= min_cand_score]
                 if len(chunk) == 0:
                     continue
 
@@ -332,7 +330,7 @@ if __name__ == '__main__':
     parser.add_argument('--sample-s1', type=int, default=None, help='Sample N S1 entities for rapid evaluation')
     parser.add_argument('--eval-gt', default=None, help='Ground truth TSV path to evaluate against')
     parser.add_argument('--threshold', type=float, default=None, help='Decision threshold override')
-    parser.add_argument('--min-cand-score', type=float, default=0.62, help='Filter dense candidate pairs below this similarity')
+    parser.add_argument('--min-cand-score', type=float, default=0.70, help='Filter dense candidate pairs below this similarity')
     args = parser.parse_args()
     predict_matches(
         split=args.split,
