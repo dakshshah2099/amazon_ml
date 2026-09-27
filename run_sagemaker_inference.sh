@@ -56,3 +56,8 @@ echo "=========================================================="
 echo "RUN COMPLETED SUCCESSFULLY! Submission uploaded to:"
 echo "${BUCKET}/submissions/matching_results.tsv"
 echo "=========================================================="
+
+# 8. Auto-stop notebook instance to avoid compute charges
+echo -e "\n>>> Step 8: Auto-stopping notebook instance to avoid billing..."
+aws sagemaker stop-notebook-instance --notebook-instance-name amazon-ml-notebook || true
+
