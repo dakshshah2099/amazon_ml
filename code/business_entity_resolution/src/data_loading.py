@@ -47,3 +47,30 @@ def load_full_record_map(parquet_path, embeddings_path, embed_ids_path):
         )
     del df
     return rec_map
+
+def load_record_map_text_only(parquet_path):
+    """
+    Memory-safe record loader for inference.
+    Loads only string/bool metadata into 6-tuples:
+        (clean_name, clean_addr, postal_code, has_state,
+         needs_trans_name, needs_trans_addr)
+    Omits 384-dim float32 vectors, saving ~16 GB of system RAM.
+    """
+    cols = [
+        'entity_id', 'business_name_clean', 'business_address_clean',
+        'postal_code', 'has_state',
+        'needs_transliteration_name', 'needs_transliteration_address'
+    ]
+    df = pd.read_parquet(parquet_path, columns=cols)
+    rec_map = {}
+    for r in df.itertuples(index=False):
+        rec_map[r.entity_id] = (
+            r.business_name_clean,
+            r.business_address_clean,
+            r.postal_code,
+            bool(r.has_state),
+            bool(r.needs_transliteration_name),
+            bool(r.needs_transliteration_address)
+        )
+    del df
+    return rec_map

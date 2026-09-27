@@ -253,8 +253,11 @@ ALL_FEATURE_NAMES = FEATURE_NAMES + EMBEDDING_FEATURE_NAMES
 def extract_pair_features(s1_rec, cand_rec, embed_score=0.0):
     """
     Computes all 30 features for an (s1_rec, cand_rec) record pair.
-    s1_rec, cand_rec: 7-tuples from load_full_record_map:
-      (clean_name, clean_addr, postal, has_state, needs_trans_name, needs_trans_addr, embedding)
+    s1_rec, cand_rec can be:
+      - 7-tuples: (clean_name, clean_addr, postal, has_state, needs_trans_name, needs_trans_addr, embedding)
+      - 6-tuples: (clean_name, clean_addr, postal, has_state, needs_trans_name, needs_trans_addr)
+    When 6-tuples are passed, embedding features are computed analytically from embed_score,
+    avoiding the need to keep 16 GB of embedding vectors in system RAM.
     """
     lexical = compute_pair_features(
         s1_rec[0], s1_rec[1], s1_rec[2],
@@ -263,6 +266,12 @@ def extract_pair_features(s1_rec, cand_rec, embed_score=0.0):
         s1_has_state=s1_rec[3], s2_has_state=cand_rec[3],
         s1_needs_trans=s1_rec[4], s2_needs_trans=cand_rec[4]
     )
-    emb_feats = compute_embedding_features(s1_rec[6], cand_rec[6])
+    if len(s1_rec) > 6 and len(cand_rec) > 6:
+        emb_feats = compute_embedding_features(s1_rec[6], cand_rec[6])
+    else:
+        cos_sim = float(embed_score)
+        l2_dist = float(np.sqrt(max(0.0, 2.0 * (1.0 - cos_sim))))
+        high_conf = 1.0 if cos_sim >= 0.75 else 0.0
+        emb_feats = [cos_sim, l2_dist, high_conf]
     return lexical + emb_feats
 

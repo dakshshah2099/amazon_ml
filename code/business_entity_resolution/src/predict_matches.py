@@ -11,7 +11,7 @@ import lightgbm as lgb
 from catboost import CatBoostClassifier
 from multiprocessing import Pool
 
-from data_loading import load_full_record_map
+from data_loading import load_record_map_text_only
 from feature_utils import ALL_FEATURE_NAMES, extract_pair_features
 
 def log(msg):
@@ -96,26 +96,14 @@ def predict_matches(
     else:
         file_prefix = f"{data_dir}/{prefix}"
 
-    log(f"Loading record maps from {file_prefix}...")
-    s1_map = load_full_record_map(
-        f"{file_prefix}_source1_clean.parquet",
-        f"{file_prefix}_source1_embeddings.npy",
-        f"{file_prefix}_source1_embed_ids.npy"
-    )
-    s2_map = load_full_record_map(
-        f"{file_prefix}_source2_clean.parquet",
-        f"{file_prefix}_source2_embeddings.npy",
-        f"{file_prefix}_source2_embed_ids.npy"
-    )
-    s3_map = load_full_record_map(
-        f"{file_prefix}_source3_clean.parquet",
-        f"{file_prefix}_source3_embeddings.npy",
-        f"{file_prefix}_source3_embed_ids.npy"
-    )
+    log(f"Loading record maps from {file_prefix} (text-only, memory safe)...")
+    s1_map = load_record_map_text_only(f"{file_prefix}_source1_clean.parquet")
+    s2_map = load_record_map_text_only(f"{file_prefix}_source2_clean.parquet")
+    s3_map = load_record_map_text_only(f"{file_prefix}_source3_clean.parquet")
     cand_map = {**s2_map, **s3_map}
     del s2_map, s3_map
     gc.collect()
-    log(f"Loaded {len(s1_map):,} S1 entities and {len(cand_map):,} candidates (S2+S3).")
+    log(f"Loaded {len(s1_map):,} S1 entities and {len(cand_map):,} candidates (S2+S3) into memory.")
 
     # Order of S1 IDs to guarantee contest output preserves order
     df_s1_order = pd.read_parquet(f"{file_prefix}_source1_clean.parquet", columns=['entity_id'])

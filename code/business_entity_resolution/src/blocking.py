@@ -119,20 +119,11 @@ def run_blocking(
 
     cols = ['entity_id', 'country', 'business_name_clean', 'business_address_clean', 'postal_code']
     df_s1 = pd.read_parquet(f"{prefix}_source1_clean.parquet", columns=cols)
-    df_s2 = pd.read_parquet(f"{prefix}_source2_clean.parquet", columns=cols)
-    df_s3 = pd.read_parquet(f"{prefix}_source3_clean.parquet", columns=cols)
-
-    emb_s1 = np.load(f"{prefix}_source1_embeddings.npy")
-    emb_s2 = np.load(f"{prefix}_source2_embeddings.npy")
-    emb_s3 = np.load(f"{prefix}_source3_embeddings.npy")
+    emb_s1 = np.load(f"{prefix}_source1_embeddings.npy", mmap_mode='r')
     ids_s1 = np.load(f"{prefix}_source1_embed_ids.npy", allow_pickle=True)
-    ids_s2 = np.load(f"{prefix}_source2_embed_ids.npy", allow_pickle=True)
-    ids_s3 = np.load(f"{prefix}_source3_embed_ids.npy", allow_pickle=True)
 
-    # Sanity checks
+    # Sanity check S1
     assert len(emb_s1) == len(ids_s1) == len(df_s1), "S1 embedding/id/parquet row count mismatch"
-    assert len(emb_s2) == len(ids_s2) == len(df_s2), "S2 embedding/id/parquet row count mismatch"
-    assert len(emb_s3) == len(ids_s3) == len(df_s3), "S3 embedding/id/parquet row count mismatch"
     assert (ids_s1 == df_s1['entity_id'].to_numpy()).all(), "S1 id order mismatch between embeddings and parquet"
 
     countries = sorted(df_s1['country'].unique().tolist())
@@ -147,25 +138,37 @@ def run_blocking(
     channel1_pairs = 0
     channel2_added_pairs = 0
 
-    for country in countries:
-        log(f"-- Country: {country} --")
-        s1_mask = (df_s1['country'] == country).to_numpy()
-        s1_c_ids = ids_s1[s1_mask]
-        s1_c_emb = emb_s1[s1_mask]
-        df_s1_c = df_s1[s1_mask]
+    import gc
 
-        # Precompute keys for S1 queries
-        s1_keys_list = [
-            extract_blocking_keys(r.business_name_clean, r.business_address_clean, r.postal_code)
-            for r in df_s1_c.itertuples(index=False)
-        ]
+    # Process Candidate Sources sequentially to keep peak RAM well under 8 GB
+    for source_name in ['source2', 'source3']:
+        log("=" * 60)
+        log(f"BLOCKING CANDIDATE SOURCE: {source_name.upper()}")
+        log("=" * 60)
 
-        for source_name, ids_src, emb_src, df_src in [
-            ('source2', ids_s2, emb_s2, df_s2), ('source3', ids_s3, emb_s3, df_s3)
-        ]:
+        df_src = pd.read_parquet(f"{prefix}_{source_name}_clean.parquet", columns=cols)
+        ids_src = np.load(f"{prefix}_{source_name}_embed_ids.npy", allow_pickle=True)
+        emb_src = np.load(f"{prefix}_{source_name}_embeddings.npy", mmap_mode='r')
+
+        assert len(emb_src) == len(ids_src) == len(df_src), f"{source_name} embedding/id/parquet row count mismatch"
+        assert (ids_src == df_src['entity_id'].to_numpy()).all(), f"{source_name} id order mismatch between embeddings and parquet"
+
+        for country in countries:
+            log(f"-- Country: {country} [{source_name.upper()}] --")
+            s1_mask = (df_s1['country'] == country).to_numpy()
+            s1_c_ids = ids_s1[s1_mask]
+            s1_c_emb = np.ascontiguousarray(emb_s1[s1_mask], dtype=np.float32)
+            df_s1_c = df_s1[s1_mask]
+
+            # Precompute keys for S1 queries
+            s1_keys_list = [
+                extract_blocking_keys(r.business_name_clean, r.business_address_clean, r.postal_code)
+                for r in df_s1_c.itertuples(index=False)
+            ]
+
             src_mask = (df_src['country'] == country).to_numpy()
             src_c_ids = ids_src[src_mask]
-            src_c_emb = emb_src[src_mask]
+            src_c_emb = np.ascontiguousarray(emb_src[src_mask], dtype=np.float32)
             df_src_c = df_src[src_mask]
 
             if len(src_c_ids) == 0 or len(s1_c_ids) == 0:
@@ -251,8 +254,12 @@ def run_blocking(
             if buf:
                 f_detailed.writelines(buf)
 
-            del index, inv_index, src_id_to_idx
-            log(f"  Done. Running total pairs: {total_pairs:,} (FAISS={channel1_pairs:,}, InvertedIndex=+{channel2_added_pairs:,})")
+            del index, inv_index, src_id_to_idx, src_c_ids, src_c_emb, s1_c_ids, s1_c_emb, df_s1_c, df_src_c, s1_keys_list
+            gc.collect()
+            log(f"  Done [{country} | {source_name.upper()}]. Running total pairs: {total_pairs:,} (FAISS={channel1_pairs:,}, InvertedIndex=+{channel2_added_pairs:,})")
+
+        del df_src, ids_src, emb_src
+        gc.collect()
 
     f_detailed.close()
     log(f"Saved {detailed_file} ({total_pairs:,} total pairs)")
