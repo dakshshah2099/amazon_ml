@@ -25,10 +25,13 @@ def embed_split(split='train', batch_size=256, max_seq_length=64, data_dir=None,
         torch.set_num_threads(num_threads)
         log(f"CUDA not detected. Running SentenceTransformer on CPU with {num_threads} threads...")
     else:
-        log(f"CUDA detected ({torch.cuda.get_device_name(0)}). Running SentenceTransformer on GPU...")
+        torch.backends.cudnn.benchmark = True
+        log(f"CUDA detected ({torch.cuda.get_device_name(0)}). Running SentenceTransformer with Tensor Core FP16 acceleration...")
 
     model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2', device=device)
     model.max_seq_length = max_seq_length
+    if device == 'cuda':
+        model = model.half()
 
     for source_num in [1, 2, 3]:
         parquet_path = f"{data_dir}/{prefix}_source{source_num}_clean.parquet"
@@ -49,17 +52,18 @@ def embed_split(split='train', batch_size=256, max_seq_length=64, data_dir=None,
             df['business_address_for_embedding'].fillna('')
         ).tolist()
 
-        log(f"Encoding {len(combined):,} records (batch_size={batch_size}, device={device})...")
+        log(f"Encoding {len(combined):,} records (batch_size={batch_size}, FP16={device == 'cuda'})...")
         t0 = time.time()
-        embeddings = model.encode(
-            combined,
-            batch_size=batch_size,
-            show_progress_bar=True,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            device=device
-        ).astype(np.float32)
-        log(f"Encoded in {time.time()-t0:.1f}s")
+        with torch.inference_mode():
+            embeddings = model.encode(
+                combined,
+                batch_size=batch_size,
+                show_progress_bar=True,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                device=device
+            ).astype(np.float32)
+        log(f"Encoded in {time.time()-t0:.1f}s ({len(combined)/(time.time()-t0):.0f} records/s)")
 
         np.save(out_path, embeddings)
         np.save(ids_path, df['entity_id'].to_numpy())
