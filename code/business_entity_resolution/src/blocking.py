@@ -375,30 +375,7 @@ def run_blocking(
                             total_master_pairs += chunk.count('\n')
 
     log(f"Saved {detailed_file} ({total_master_pairs:,} total rows)")
-
-    final_cand_file = os.path.join(out_dir, f"{split}_candidate_pairs.tsv" if split == 'train' else "candidate_pairs.tsv")
-    log(f"Writing {final_cand_file} from detailed candidate pairs...")
-    cand_agg = defaultdict(set)
-    with open(detailed_file, 'r', encoding='utf-8') as f_det:
-        next(f_det, None)
-        for line in f_det:
-            pts = line.split('\t')
-            if len(pts) >= 2:
-                cand_agg[pts[0]].add(pts[1])
-
-    with open(final_cand_file, 'w', encoding='utf-8') as f_cand:
-        f_cand.write("source1_entity_id\tcandidate_entity_ids\n")
-        buf = []
-        for s1_id in df_s1['entity_id']:
-            buf.append(f"{s1_id}\t{','.join(cand_agg.get(s1_id, set()))}\n")
-            if len(buf) >= 100000:
-                f_cand.writelines(buf)
-                buf = []
-        if buf:
-            f_cand.writelines(buf)
-    del cand_agg
-    gc.collect()
-    log(f"Saved {final_cand_file}")
+    log("Blocking complete. Detailed candidate pairs ready for prediction.")
 
 # Backward-compat alias
 run_blocking_v2 = run_blocking
