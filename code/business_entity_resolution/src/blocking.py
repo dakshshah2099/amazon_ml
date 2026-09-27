@@ -196,9 +196,11 @@ def run_blocking(
 
             if use_gpu:
                 gpu_name = torch.cuda.get_device_name(0)
-                log(f"  [Stage 1/2: Dense GPU Search] Utilizing {gpu_name} (Tensor Core FP16 matrix multiplication + topk)!")
+                # Cap intermediate sims matrix at 2.0 GB to guarantee zero CUDA OOM on 16GB T4
+                max_sims_bytes = 2.0 * 1024 * 1024 * 1024
+                batch_size = min(1000, max(100, int(max_sims_bytes / (len(src_c_indices) * 2))))
+                log(f"  [Stage 1/2: Dense GPU Search] Utilizing {gpu_name} (batch_size={batch_size}, FP16 Tensor Cores)!")
                 cand_gpu = torch.from_numpy(src_c_emb).to('cuda', dtype=torch.float16)
-                batch_size = 10000
             else:
                 log(f"  [Stage 1/2: Dense CPU Search] Fallback to FAISS CPU IndexFlatIP...")
                 dim = src_c_emb.shape[1]
@@ -212,7 +214,7 @@ def run_blocking(
 
             for batch_idx, q_start in enumerate(range(0, len(s1_c_emb), batch_size), 1):
                 q_end = min(q_start + batch_size, len(s1_c_emb))
-                if batch_idx % 5 == 1 or q_end == len(s1_c_emb):
+                if batch_idx % 100 == 1 or q_end == len(s1_c_emb):
                     log(f"    [Dense {'GPU' if use_gpu else 'FAISS'} | {country}] Batch {batch_idx}/{total_q_batches} ({q_end:,}/{len(s1_c_emb):,} queries)...")
 
                 if use_gpu:
