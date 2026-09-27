@@ -140,6 +140,7 @@ def predict_matches(
     matched_results = defaultdict(set)
     total_pairs_processed = 0
     total_matches_found = 0
+    raw_lines_scanned = 0
     t0 = time.time()
 
     with Pool(processes=num_workers, initializer=_init_worker, initargs=(s1_map, cand_map)) as pool:
@@ -150,6 +151,7 @@ def predict_matches(
             dtype={'source1_entity_id': str, 'candidate_entity_id': str, 'embed_score': float},
             chunksize=chunksize
         )):
+            raw_lines_scanned += len(chunk)
             if min_cand_score is not None and min_cand_score > 0.0:
                 chunk = chunk[chunk['embed_score'] >= min_cand_score]
                 if len(chunk) == 0:
@@ -210,15 +212,15 @@ def predict_matches(
 
             total_pairs_processed += len(pairs_to_score)
             elapsed = time.time() - t0
-            rate = total_pairs_processed / elapsed if elapsed > 0 else 0
-            eta_s = (total_file_lines - total_pairs_processed) / rate if (rate > 0 and total_file_lines > total_pairs_processed) else 0
-            pct = (total_pairs_processed / total_file_lines) * 100 if total_file_lines > 0 else 0
+            raw_rate = raw_lines_scanned / elapsed if elapsed > 0 else 0
+            eta_s = (total_file_lines - raw_lines_scanned) / raw_rate if (raw_rate > 0 and total_file_lines > raw_lines_scanned) else 0
+            pct = (raw_lines_scanned / total_file_lines) * 100 if total_file_lines > 0 else 0
             chunk_num_str = f"{chunk_idx + 1}/{total_chunks}" if total_chunks > 0 else f"{chunk_idx + 1}"
             pct_str = f" ({pct:.1f}%)" if total_file_lines > 0 else ""
             eta_str = f" | ETA: {eta_s/60:.1f} min" if eta_s > 0 else ""
 
-            if (chunk_idx + 1) % 2 == 1 or len(pairs_to_score) < chunksize or (total_file_lines > 0 and total_pairs_processed >= total_file_lines):
-                log(f"  [Predict Chunk {chunk_num_str}]{pct_str} Processed {total_pairs_processed:,} pairs ({rate:,.0f} pairs/s) | {total_matches_found:,} matches found{eta_str}")
+            if (chunk_idx + 1) % 2 == 1 or raw_lines_scanned >= total_file_lines:
+                log(f"  [Predict Chunk {chunk_num_str}]{pct_str} Scored {total_pairs_processed:,} pairs ({raw_rate:,.0f} rows/s scanned) | {total_matches_found:,} matches found{eta_str}")
 
     del s1_map, cand_map
     gc.collect()
