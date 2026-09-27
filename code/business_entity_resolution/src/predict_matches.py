@@ -149,6 +149,7 @@ def predict_matches(
             usecols=['source1_entity_id', 'candidate_entity_id', 'embed_score'],
             dtype={'source1_entity_id': str, 'candidate_entity_id': str, 'embed_score': float},
             chunksize=chunksize
+        )):
             if min_cand_score is not None and min_cand_score > 0.0:
                 chunk = chunk[chunk['embed_score'] >= min_cand_score]
                 if len(chunk) == 0:
