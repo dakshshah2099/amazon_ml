@@ -5,6 +5,7 @@ import argparse
 from collections import defaultdict
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import faiss
 try:
     import torch
@@ -255,39 +256,44 @@ def run_blocking(
                 f_part.flush()
                 buf = []
 
-            # Free GPU VRAM immediately; keep src_c_emb in system RAM for fast Stage 2 lookups
+            # Purge dense search data immediately from RAM and GPU VRAM
             if use_gpu:
                 del cand_gpu
                 torch.cuda.empty_cache()
             else:
                 del index
-            log(f"    [Dense {'GPU' if use_gpu else 'FAISS'} Complete] Intermediate pairs so far: {country_pairs:,}")
+            del src_c_emb
+            gc.collect()
+            log(f"    [Dense {'GPU' if use_gpu else 'FAISS'} Complete] Freed candidate embeddings from RAM. Intermediate pairs so far: {country_pairs:,}")
 
             # -------------------------------------------------------------
             # STAGE 2: Inverted Index Lexical Blocking (Channel 2)
             # -------------------------------------------------------------
-            log(f"  [Stage 2/2: Inverted Index] Loading text records for {country}...")
-            df_src_c = pd.read_parquet(
-                f"{prefix}_{source_name}_clean.parquet",
-                columns=['entity_id', 'business_name_clean', 'business_address_clean', 'postal_code'],
-                filters=[('country', '==', country)]
-            )
-
+            log(f"  [Stage 2/2: Inverted Index] Streaming text records for {country} (memory-safe)...")
             inv_index = {}
             oversized_keys = set()
-            for c_idx, r in enumerate(df_src_c.itertuples(index=False)):
-                for key in extract_blocking_keys(r.business_name_clean, r.business_address_clean, r.postal_code):
-                    if key in oversized_keys:
-                        continue
-                    bucket = inv_index.get(key)
-                    if bucket is None:
-                        inv_index[key] = [c_idx]
-                    elif len(bucket) < max_bucket_size:
-                        bucket.append(c_idx)
-                    else:
-                        del inv_index[key]
-                        oversized_keys.add(key)
-            del oversized_keys
+            pf = pq.ParquetFile(f"{prefix}_{source_name}_clean.parquet")
+            c_idx = 0
+            for batch in pf.iter_batches(batch_size=100_000, columns=['country', 'business_name_clean', 'business_address_clean', 'postal_code']):
+                df_b = batch.to_pandas()
+                df_b_c = df_b[df_b['country'] == country]
+                for r in df_b_c.itertuples(index=False):
+                    for key in extract_blocking_keys(r.business_name_clean, r.business_address_clean, r.postal_code):
+                        if key in oversized_keys:
+                            continue
+                        bucket = inv_index.get(key)
+                        if bucket is None:
+                            inv_index[key] = [c_idx]
+                        elif len(bucket) < max_bucket_size:
+                            bucket.append(c_idx)
+                        else:
+                            del inv_index[key]
+                            oversized_keys.add(key)
+                    c_idx += 1
+                del df_b, df_b_c
+
+            del oversized_keys, pf
+            gc.collect()
             log(f"    Built sparse inverted index with {len(inv_index):,} active buckets (capped <= {max_bucket_size}).")
 
             s1_names = df_s1_c['business_name_clean'].tolist()
@@ -312,7 +318,8 @@ def run_blocking(
                 if new_cand_indices:
                     s1_vec = s1_c_emb[q_idx]
                     for c_idx in new_cand_indices:
-                        c_vec = src_c_emb[c_idx]  # In-RAM lookup (0 nanoseconds, zero disk IOPS)
+                        c_global_idx = src_c_indices[c_idx]
+                        c_vec = emb_src[c_global_idx]  # on-demand mmap disk access
                         sc = float(np.dot(s1_vec, c_vec))
                         c_id = src_c_ids[c_idx]
                         buf.append(f"{s1_id}\t{c_id}\t{source_name}\t{sc:.5f}\n")
@@ -340,7 +347,7 @@ def run_blocking(
                 f_d.write(f"{country_pairs}\n")
             log(f"  [Checkpoint Written] Flushed {country_pairs:,} pairs to {part_file} and marked done.")
 
-            del inv_index, df_src_c, seen_cands_map, s1_names, s1_addrs, s1_pcs, s1_c_ids, s1_c_emb, df_s1_c, src_c_emb
+            del inv_index, seen_cands_map, s1_names, s1_addrs, s1_pcs, s1_c_ids, s1_c_emb, df_s1_c
             gc.collect()
 
         del src_country_arr, ids_src, emb_src
