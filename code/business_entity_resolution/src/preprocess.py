@@ -53,6 +53,17 @@ def process_file(in_path, out_path, chunksize=100000, batch_size=5000, max_worke
     collected_examples = []
     trans_examples = []
     
+    total_file_lines = 0
+    if os.path.exists(in_path):
+        try:
+            with open(in_path, 'rb') as f_cnt:
+                total_file_lines = max(0, sum(chunk.count(b'\n') for chunk in iter(lambda: f_cnt.read(4 * 1024 * 1024), b'')) - 1)
+        except Exception:
+            total_file_lines = 0
+    total_chunks = (total_file_lines + chunksize - 1) // chunksize if total_file_lines > 0 else 0
+    if total_chunks > 0:
+        print(f"  Streaming {total_file_lines:,} rows across {total_chunks:,} chunks (chunksize={chunksize:,})...")
+
     # Use PyArrow ParquetWriter to write chunks sequentially
     writer = None
     
@@ -103,7 +114,13 @@ def process_file(in_path, out_path, chunksize=100000, batch_size=5000, max_worke
                 writer.write_table(table)
                 
                 elapsed = time.time() - start_time
-                print(f"  Chunk {chunk_idx + 1} processed: {total_rows} rows so far ({total_rows/elapsed:.0f} rows/s)")
+                rate = total_rows / elapsed if elapsed > 0 else 0
+                eta_s = (total_file_lines - total_rows) / rate if (rate > 0 and total_file_lines > total_rows) else 0
+                pct = (total_rows / total_file_lines) * 100 if total_file_lines > 0 else 0
+                chunk_num_str = f"{chunk_idx + 1}/{total_chunks}" if total_chunks > 0 else f"{chunk_idx + 1}"
+                pct_str = f" ({pct:.1f}%)" if total_file_lines > 0 else ""
+                eta_str = f" | ETA: {eta_s/60:.1f} min" if eta_s > 0 else ""
+                print(f"  [Chunk {chunk_num_str}]{pct_str} processed: {total_rows:,} rows ({rate:,.0f} rows/s){eta_str}")
     finally:
         if writer is not None:
             writer.close()

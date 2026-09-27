@@ -59,25 +59,34 @@ def embed_split(split='train', batch_size=256, max_seq_length=64, data_dir=None,
         gc.collect()
 
         n_total = len(combined)
-        log(f"Encoding {n_total:,} records in memory-safe 100k chunks (batch_size={batch_size}, FP16={device == 'cuda'})...")
+        chunk_step = 100_000
+        total_chunks = (n_total + chunk_step - 1) // chunk_step
+        log(f"Encoding {n_total:,} records across {total_chunks} memory-safe chunks (batch_size={batch_size}, FP16={device == 'cuda'})...")
         t0 = time.time()
 
         embeddings = np.empty((n_total, 384), dtype=np.float32)
-        chunk_step = 100_000
 
         with torch.inference_mode():
-            for c_start in range(0, n_total, chunk_step):
+            for chunk_idx, c_start in enumerate(range(0, n_total, chunk_step), 1):
+                t_chunk = time.time()
                 c_end = min(c_start + chunk_step, n_total)
                 sub_texts = combined[c_start:c_end]
+                pct = (c_end / n_total) * 100
+                log(f"  [SOURCE{source_num} Chunk {chunk_idx}/{total_chunks}] Encoding records {c_start+1:,} to {c_end:,} ({pct:.1f}%)...")
                 sub_emb = model.encode(
                     sub_texts,
                     batch_size=batch_size,
-                    show_progress_bar=True,
+                    show_progress_bar=False,
                     convert_to_numpy=True,
                     normalize_embeddings=True,
                     device=device
                 )
                 embeddings[c_start:c_end] = sub_emb.astype(np.float32)
+                chunk_time = time.time() - t_chunk
+                elapsed = time.time() - t0
+                rate = c_end / elapsed if elapsed > 0 else 0
+                eta_s = (n_total - c_end) / rate if rate > 0 else 0
+                log(f"  [SOURCE{source_num} Chunk {chunk_idx}/{total_chunks}] Done in {chunk_time:.1f}s | Avg rate: {rate:,.0f} rec/s | ETA: {eta_s/60:.1f} min")
                 del sub_texts, sub_emb
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()

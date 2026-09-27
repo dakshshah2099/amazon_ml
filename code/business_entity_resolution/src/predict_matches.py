@@ -135,8 +135,20 @@ def predict_matches(
     # 3. Stream Candidates and Predict
     cand_detailed_path = os.path.join(cand_dir, f"{split}_candidate_pairs_detailed.tsv")
     log(f"Streaming candidate pairs from {cand_detailed_path}...")
-    matched_results = defaultdict(set)
+    
+    total_file_lines = 0
+    if os.path.exists(cand_detailed_path):
+        try:
+            with open(cand_detailed_path, 'rb') as f_cnt:
+                total_file_lines = max(0, sum(chunk.count(b'\n') for chunk in iter(lambda: f_cnt.read(4 * 1024 * 1024), b'')) - 1)
+        except Exception:
+            total_file_lines = 0
+    
+    total_chunks = (total_file_lines + chunksize - 1) // chunksize if total_file_lines > 0 else 0
+    chunk_str = f" across {total_chunks:,} chunks" if total_chunks > 0 else ""
+    log(f"Total candidate pairs to score: {total_file_lines:,}{chunk_str}")
 
+    matched_results = defaultdict(set)
     total_pairs_processed = 0
     total_matches_found = 0
     t0 = time.time()
@@ -205,8 +217,14 @@ def predict_matches(
             total_pairs_processed += len(pairs_to_score)
             elapsed = time.time() - t0
             rate = total_pairs_processed / elapsed if elapsed > 0 else 0
-            if (chunk_idx + 1) % 5 == 0 or len(pairs_to_score) < chunksize:
-                log(f"Processed {total_pairs_processed:,} pairs ({rate:,.0f} pairs/s) -> {total_matches_found:,} matches found")
+            eta_s = (total_file_lines - total_pairs_processed) / rate if (rate > 0 and total_file_lines > total_pairs_processed) else 0
+            pct = (total_pairs_processed / total_file_lines) * 100 if total_file_lines > 0 else 0
+            chunk_num_str = f"{chunk_idx + 1}/{total_chunks}" if total_chunks > 0 else f"{chunk_idx + 1}"
+            pct_str = f" ({pct:.1f}%)" if total_file_lines > 0 else ""
+            eta_str = f" | ETA: {eta_s/60:.1f} min" if eta_s > 0 else ""
+
+            if (chunk_idx + 1) % 2 == 1 or len(pairs_to_score) < chunksize or (total_file_lines > 0 and total_pairs_processed >= total_file_lines):
+                log(f"  [Predict Chunk {chunk_num_str}]{pct_str} Processed {total_pairs_processed:,} pairs ({rate:,.0f} pairs/s) | {total_matches_found:,} matches found{eta_str}")
 
     del s1_map, cand_map
     gc.collect()

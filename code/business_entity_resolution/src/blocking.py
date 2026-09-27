@@ -201,9 +201,12 @@ def run_blocking(
             k_val = min(k, index.ntotal)
             batch_size = 20000
             buf = []
+            total_q_batches = (len(s1_c_emb) + batch_size - 1) // batch_size
 
-            for q_start in range(0, len(s1_c_emb), batch_size):
+            for batch_idx, q_start in enumerate(range(0, len(s1_c_emb), batch_size), 1):
                 q_end = min(q_start + batch_size, len(s1_c_emb))
+                if batch_idx % 2 == 1 or q_end == len(s1_c_emb):
+                    log(f"  [{country} | {source_name.upper()}] Batch {batch_idx}/{total_q_batches} ({q_end:,}/{len(s1_c_emb):,} queries, {total_pairs:,} total candidate pairs so far)...")
                 scores, indices = index.search(s1_c_emb[q_start:q_end], k_val)
 
                 for i in range(indices.shape[0]):
