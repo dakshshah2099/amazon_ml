@@ -45,6 +45,7 @@ python code/business_entity_resolution/src/predict_matches.py \
   --model-cb models/cb_matcher.cbm \
   --meta models/matcher_metadata.pkl \
   --out output/matching_results.tsv \
+  --min-cand-score 0.52 \
   --threshold 0.92 \
   --workers 4
 
