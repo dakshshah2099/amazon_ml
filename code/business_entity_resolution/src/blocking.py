@@ -90,18 +90,19 @@ def run_blocking(
     k=20,
     min_score=0.40,
     approx=False,
+    dense_only=False,
     data_dir=None,
     prefix=None,
     max_bucket_size=30
 ):
     """
     Decoupled Hybrid Blocking:
-    Stage A (FAISS): High-dimensional semantic search. Frees all candidate embeddings upon completion.
-    Stage B (Inverted Index): Ultra-compact lexical/address index using on-demand disk-mmap dot products.
+    Stage A (FAISS/GPU): High-dimensional semantic search. Frees all candidate embeddings upon completion.
+    Stage B (Inverted Index): Ultra-compact lexical/address index without disk I/O.
     Peak system RAM is guaranteed < 5.5 GB at all times.
     """
     log("=" * 70)
-    log(f"DECOUPLED HYBRID BLOCKING: split={split.upper()} K={k} min_score={min_score} approx={approx} max_bucket={max_bucket_size}")
+    log(f"DECOUPLED HYBRID BLOCKING: split={split.upper()} K={k} min_score={min_score} approx={approx} dense_only={dense_only} max_bucket={max_bucket_size}")
     log("=" * 70)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -262,80 +263,81 @@ def run_blocking(
                 torch.cuda.empty_cache()
             else:
                 del index
-            del src_c_emb
+            del src_c_emb, s1_c_emb
             gc.collect()
             log(f"    [Dense {'GPU' if use_gpu else 'FAISS'} Complete] Freed candidate embeddings from RAM. Intermediate pairs so far: {country_pairs:,}")
 
-            # -------------------------------------------------------------
-            # STAGE 2: Inverted Index Lexical Blocking (Channel 2)
-            # -------------------------------------------------------------
-            log(f"  [Stage 2/2: Inverted Index] Streaming text records for {country} (memory-safe)...")
-            inv_index = {}
-            oversized_keys = set()
-            pf = pq.ParquetFile(f"{prefix}_{source_name}_clean.parquet")
-            c_idx = 0
-            for batch in pf.iter_batches(batch_size=100_000, columns=['country', 'business_name_clean', 'business_address_clean', 'postal_code']):
-                df_b = batch.to_pandas()
-                df_b_c = df_b[df_b['country'] == country]
-                for r in df_b_c.itertuples(index=False):
-                    for key in extract_blocking_keys(r.business_name_clean, r.business_address_clean, r.postal_code):
-                        if key in oversized_keys:
-                            continue
+            if not dense_only:
+                # -------------------------------------------------------------
+                # STAGE 2: Inverted Index Lexical Blocking (Channel 2)
+                # -------------------------------------------------------------
+                log(f"  [Stage 2/2: Inverted Index] Streaming text records for {country} (memory-safe)...")
+                inv_index = {}
+                oversized_keys = set()
+                pf = pq.ParquetFile(f"{prefix}_{source_name}_clean.parquet")
+                c_idx = 0
+                for batch in pf.iter_batches(batch_size=100_000, columns=['country', 'business_name_clean', 'business_address_clean', 'postal_code']):
+                    df_b = batch.to_pandas()
+                    df_b_c = df_b[df_b['country'] == country]
+                    for r in df_b_c.itertuples(index=False):
+                        for key in extract_blocking_keys(r.business_name_clean, r.business_address_clean, r.postal_code):
+                            if key in oversized_keys:
+                                continue
+                            bucket = inv_index.get(key)
+                            if bucket is None:
+                                inv_index[key] = [c_idx]
+                            elif len(bucket) < max_bucket_size:
+                                bucket.append(c_idx)
+                            else:
+                                del inv_index[key]
+                                oversized_keys.add(key)
+                        c_idx += 1
+                    del df_b, df_b_c
+
+                del oversized_keys, pf
+                gc.collect()
+                log(f"    Built sparse inverted index with {len(inv_index):,} active buckets (capped <= {max_bucket_size}).")
+
+                s1_names = df_s1_c['business_name_clean'].tolist()
+                s1_addrs = df_s1_c['business_address_clean'].tolist()
+                s1_pcs = df_s1_c['postal_code'].tolist()
+
+                c2_country_added = 0
+                for q_idx in range(len(s1_c_ids)):
+                    s1_id = s1_c_ids[q_idx]
+                    s1_seen = seen_cands_map[q_idx]
+                    keys = extract_blocking_keys(s1_names[q_idx], s1_addrs[q_idx], s1_pcs[q_idx])
+
+                    new_cand_indices = []
+                    for key in keys:
                         bucket = inv_index.get(key)
-                        if bucket is None:
-                            inv_index[key] = [c_idx]
-                        elif len(bucket) < max_bucket_size:
-                            bucket.append(c_idx)
-                        else:
-                            del inv_index[key]
-                            oversized_keys.add(key)
-                    c_idx += 1
-                del df_b, df_b_c
+                        if bucket:
+                            for c_idx in bucket:
+                                if c_idx not in s1_seen:
+                                    s1_seen.add(c_idx)
+                                    new_cand_indices.append(c_idx)
 
-            del oversized_keys, pf
-            gc.collect()
-            log(f"    Built sparse inverted index with {len(inv_index):,} active buckets (capped <= {max_bucket_size}).")
+                    if new_cand_indices:
+                        for c_idx in new_cand_indices:
+                            c_id = src_c_ids[c_idx]
+                            sc = 0.55000  # Lexical match; avoids millions of random EBS disk page faults
+                            buf.append(f"{s1_id}\t{c_id}\t{source_name}\t{sc:.5f}\n")
+                            total_pairs += 1
+                            country_pairs += 1
+                            channel2_added_pairs += 1
+                            c2_country_added += 1
 
-            s1_names = df_s1_c['business_name_clean'].tolist()
-            s1_addrs = df_s1_c['business_address_clean'].tolist()
-            s1_pcs = df_s1_c['postal_code'].tolist()
+                    if len(buf) >= 100000:
+                        f_part.writelines(buf)
+                        f_part.flush()
+                        buf = []
 
-            c2_country_added = 0
-            for q_idx in range(len(s1_c_ids)):
-                s1_id = s1_c_ids[q_idx]
-                s1_seen = seen_cands_map[q_idx]
-                keys = extract_blocking_keys(s1_names[q_idx], s1_addrs[q_idx], s1_pcs[q_idx])
+                    if (q_idx + 1) % 100_000 == 0 or (q_idx + 1) == len(s1_c_ids):
+                        pct = ((q_idx + 1) / len(s1_c_ids)) * 100
+                        log(f"    [Inverted Index | {country}] {q_idx + 1:,}/{len(s1_c_ids):,} ({pct:.1f}%) queries processed (+{c2_country_added:,} pairs added)...")
 
-                new_cand_indices = []
-                for key in keys:
-                    bucket = inv_index.get(key)
-                    if bucket:
-                        for c_idx in bucket:
-                            if c_idx not in s1_seen:
-                                s1_seen.add(c_idx)
-                                new_cand_indices.append(c_idx)
-
-                if new_cand_indices:
-                    s1_vec = s1_c_emb[q_idx]
-                    for c_idx in new_cand_indices:
-                        c_global_idx = src_c_indices[c_idx]
-                        c_vec = emb_src[c_global_idx]  # on-demand mmap disk access
-                        sc = float(np.dot(s1_vec, c_vec))
-                        c_id = src_c_ids[c_idx]
-                        buf.append(f"{s1_id}\t{c_id}\t{source_name}\t{sc:.5f}\n")
-                        total_pairs += 1
-                        country_pairs += 1
-                        channel2_added_pairs += 1
-                        c2_country_added += 1
-
-                if len(buf) >= 100000:
-                    f_part.writelines(buf)
-                    f_part.flush()
-                    buf = []
-
-                if (q_idx + 1) % 100_000 == 0 or (q_idx + 1) == len(s1_c_ids):
-                    pct = ((q_idx + 1) / len(s1_c_ids)) * 100
-                    log(f"    [Inverted Index | {country}] {q_idx + 1:,}/{len(s1_c_ids):,} ({pct:.1f}%) queries processed (+{c2_country_added:,} pairs added)...")
+                del inv_index, s1_names, s1_addrs, s1_pcs
+                gc.collect()
 
             if buf:
                 f_part.writelines(buf)
@@ -347,11 +349,14 @@ def run_blocking(
                 f_d.write(f"{country_pairs}\n")
             log(f"  [Checkpoint Written] Flushed {country_pairs:,} pairs to {part_file} and marked done.")
 
-            del inv_index, seen_cands_map, s1_names, s1_addrs, s1_pcs, s1_c_ids, s1_c_emb, df_s1_c
+            del seen_cands_map, s1_c_ids, df_s1_c
             gc.collect()
 
         del src_country_arr, ids_src, emb_src
         gc.collect()
+
+    del emb_s1, ids_s1
+    gc.collect()
 
     # Consolidate all intermediate country files into master detailed file
     log("=" * 60)
@@ -517,6 +522,7 @@ if __name__ == '__main__':
     parser.add_argument('--min-score', type=float, default=0.40)
     parser.add_argument('--max-bucket', type=int, default=30)
     parser.add_argument('--approx', action='store_true', default=False)
+    parser.add_argument('--dense-only', action='store_true', default=False, help="Run only GPU dense vector search")
     parser.add_argument('--tune', action='store_true', default=False, help="Run threshold tuning on sample")
     parser.add_argument('--sample-size', type=int, default=5000)
     parser.add_argument('--gt', type=str, default='dataset/train/train_ground_truth.tsv')
@@ -539,6 +545,7 @@ if __name__ == '__main__':
             min_score=args.min_score,
             max_bucket_size=args.max_bucket,
             approx=args.approx,
+            dense_only=args.dense_only,
             data_dir=args.data_dir,
             prefix=args.prefix
         )
