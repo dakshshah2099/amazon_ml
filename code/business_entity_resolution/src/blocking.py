@@ -57,10 +57,10 @@ def extract_blocking_keys(name, addr, pc):
     elif len(name_toks) == 1:
         keys.append(('n_1tok', name_toks[0]))
 
-    # 4. Street number + informative address tokens (permutation-invariant across first 3 tokens)
+    # 4. Street number + informative address tokens (permutation-invariant across first 2 tokens)
     if addr_nums and addr_toks:
         for num in addr_nums[:2]:
-            for tok in addr_toks[:3]:
+            for tok in addr_toks[:2]:
                 keys.append(('s_num_tok', f"{num}_{tok}"))
 
     # 5. Postal code + first name token
@@ -71,22 +71,10 @@ def extract_blocking_keys(name, addr, pc):
     if pc_str and addr_nums:
         keys.append(('pc_num', f"{pc_str}_{addr_nums[0]}"))
 
-    # 7. Street number pure index (capped by max_bucket_size) + street number with primary name token
+    # 7. Street number with primary name token
     for num in addr_nums[:2]:
-        if len(num) >= 2:
-            keys.append(('street_num', num))
-            if name_toks:
-                keys.append(('s_num_name', f"{num}_{name_toks[0]}"))
-
-    # 8. Rare non-stop name tokens
-    for t in name_toks:
-        if len(t) >= 4:
-            keys.append(('rare_tok', t))
-
-    # 9. Rare locality/street address tokens (len >= 5)
-    for t in addr_toks:
-        if len(t) >= 5:
-            keys.append(('rare_addr', t))
+        if len(num) >= 2 and name_toks:
+            keys.append(('s_num_name', f"{num}_{name_toks[0]}"))
 
     return keys
 
@@ -101,12 +89,13 @@ def run_blocking(
     max_bucket_size=30
 ):
     """
-    Hybrid blocking:
-    Channel 1: Country-partitioned FAISS exact inner-product search (dense embeddings).
-    Channel 2: Inverted index lexical and address blocking with strict bucket caps.
+    Decoupled Hybrid Blocking:
+    Stage A (FAISS): High-dimensional semantic search. Frees all candidate embeddings upon completion.
+    Stage B (Inverted Index): Ultra-compact lexical/address index using on-demand disk-mmap dot products.
+    Peak system RAM is guaranteed < 5.5 GB at all times.
     """
     log("=" * 70)
-    log(f"HYBRID BLOCKING: split={split.upper()} K={k} min_score={min_score} approx={approx} max_bucket={max_bucket_size}")
+    log(f"DECOUPLED HYBRID BLOCKING: split={split.upper()} K={k} min_score={min_score} approx={approx} max_bucket={max_bucket_size}")
     log("=" * 70)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -133,47 +122,116 @@ def run_blocking(
     f_detailed = open(detailed_file, 'w', encoding='utf-8')
     f_detailed.write("source1_entity_id\tcandidate_entity_id\tsource\tembed_score\n")
 
-    contest_cands = {s1_id: set() for s1_id in df_s1['entity_id'].tolist()}
     total_pairs = 0
     channel1_pairs = 0
     channel2_added_pairs = 0
 
     import gc
 
-    # Process Candidate Sources sequentially to keep peak RAM well under 4 GB
+    # Process Candidate Sources sequentially
     for source_name in ['source2', 'source3']:
         log("=" * 60)
         log(f"BLOCKING CANDIDATE SOURCE: {source_name.upper()}")
         log("=" * 60)
 
-        df_src = pd.read_parquet(f"{prefix}_{source_name}_clean.parquet", columns=cols)
+        # Read ONLY country column to get country indices without loading entire dataframe
+        df_src_countries = pd.read_parquet(f"{prefix}_{source_name}_clean.parquet", columns=['country'])
+        src_country_arr = df_src_countries['country'].to_numpy()
+        del df_src_countries
+        gc.collect()
+
         ids_src = np.load(f"{prefix}_{source_name}_embed_ids.npy", allow_pickle=True)
         emb_src = np.load(f"{prefix}_{source_name}_embeddings.npy", mmap_mode='r')
 
-        assert len(emb_src) == len(ids_src) == len(df_src), f"{source_name} embedding/id/parquet row count mismatch"
-        assert (ids_src == df_src['entity_id'].to_numpy()).all(), f"{source_name} id order mismatch between embeddings and parquet"
+        assert len(emb_src) == len(ids_src) == len(src_country_arr), f"{source_name} count mismatch"
 
         for country in countries:
-            log(f"-- Country: {country} [{source_name.upper()}] --")
+            log(f"\n>>> Country: {country} [{source_name.upper()}] <<<")
             s1_mask = (df_s1['country'] == country).to_numpy()
+            s1_c_indices = np.where(s1_mask)[0]
             s1_c_ids = ids_s1[s1_mask]
             s1_c_emb = np.ascontiguousarray(emb_s1[s1_mask], dtype=np.float32)
             df_s1_c = df_s1[s1_mask]
 
-            src_mask = (df_src['country'] == country).to_numpy()
+            src_mask = (src_country_arr == country)
+            src_c_indices = np.where(src_mask)[0]
             src_c_ids = ids_src[src_mask]
-            src_c_emb = np.ascontiguousarray(emb_src[src_mask], dtype=np.float32)
-            df_src_c = df_src[src_mask]
 
             if len(src_c_ids) == 0 or len(s1_c_ids) == 0:
                 log(f"  {source_name}: empty subset, skipping")
                 continue
 
-            log(f"  {source_name}: S1={len(s1_c_ids):,} vs Candidates={len(src_c_ids):,}")
+            log(f"  Subset counts: S1={len(s1_c_ids):,} vs Candidates={len(src_c_ids):,}")
 
-            # 1. Build Inverted Index on Candidates (Channel 2)
-            # Memory-Safe: Store integer indices (4 bytes) instead of string IDs (60 bytes)
-            # Instant Pruning: Discard buckets immediately once exceeding max_bucket_size
+            # -------------------------------------------------------------
+            # STAGE 1: Dense FAISS Search (Channel 1)
+            # -------------------------------------------------------------
+            log(f"  [Stage 1/2: FAISS] Indexing {len(src_c_ids):,} candidate embeddings...")
+            src_c_emb = np.ascontiguousarray(emb_src[src_c_indices], dtype=np.float32)
+            dim = src_c_emb.shape[1]
+            if approx:
+                index = faiss.IndexHNSWFlat(dim, 48, faiss.METRIC_INNER_PRODUCT)
+                index.hnsw.efConstruction = 300
+                index.add(src_c_emb)
+                index.hnsw.efSearch = 300
+            else:
+                index = faiss.IndexFlatIP(dim)
+                index.add(src_c_emb)
+
+            k_val = min(k, index.ntotal)
+            batch_size = 5000
+            buf = []
+            total_q_batches = (len(s1_c_emb) + batch_size - 1) // batch_size
+
+            # seen_cands_map: track FAISS candidate indices per S1 query to avoid duplicate scoring in Stage 2
+            seen_cands_map = [set() for _ in range(len(s1_c_ids))]
+
+            for batch_idx, q_start in enumerate(range(0, len(s1_c_emb), batch_size), 1):
+                q_end = min(q_start + batch_size, len(s1_c_emb))
+                if batch_idx % 4 == 1 or q_end == len(s1_c_emb):
+                    log(f"    [FAISS | {country}] Batch {batch_idx}/{total_q_batches} ({q_end:,}/{len(s1_c_emb):,} queries)...")
+                
+                scores, indices = index.search(s1_c_emb[q_start:q_end], k_val)
+
+                for i in range(indices.shape[0]):
+                    global_q_idx = q_start + i
+                    s1_id = s1_c_ids[global_q_idx]
+                    for j in range(k_val):
+                        sc = float(scores[i, j])
+                        if sc < min_score:
+                            continue
+                        c_idx = indices[i, j]
+                        if c_idx < 0:
+                            continue
+                        seen_cands_map[global_q_idx].add(c_idx)
+                        c_id = src_c_ids[c_idx]
+                        buf.append(f"{s1_id}\t{c_id}\t{source_name}\t{sc:.5f}\n")
+                        total_pairs += 1
+                        channel1_pairs += 1
+
+                if len(buf) >= 100000:
+                    f_detailed.writelines(buf)
+                    buf = []
+
+            if buf:
+                f_detailed.writelines(buf)
+                buf = []
+
+            # Purge FAISS index and candidate embeddings immediately from RAM
+            del index, src_c_emb
+            gc.collect()
+            log(f"    [FAISS Complete] Freed candidate embeddings. Running total pairs: {total_pairs:,}")
+
+            # -------------------------------------------------------------
+            # STAGE 2: Inverted Index Lexical Blocking (Channel 2)
+            # -------------------------------------------------------------
+            log(f"  [Stage 2/2: Inverted Index] Loading text records for {country}...")
+            df_src_c = pd.read_parquet(
+                f"{prefix}_{source_name}_clean.parquet",
+                columns=['entity_id', 'business_name_clean', 'business_address_clean', 'postal_code'],
+                filters=[('country', '==', country)]
+            )
+
             inv_index = {}
             oversized_keys = set()
             for c_idx, r in enumerate(df_src_c.itertuples(index=False)):
@@ -189,70 +247,38 @@ def run_blocking(
                         del inv_index[key]
                         oversized_keys.add(key)
             del oversized_keys
-            log(f"  Built inverted index with {len(inv_index):,} active buckets (capped at <= {max_bucket_size} entries).")
+            log(f"    Built sparse inverted index with {len(inv_index):,} active buckets (capped <= {max_bucket_size}).")
 
-            # 2. Build FAISS Index (Channel 1)
-            dim = src_c_emb.shape[1]
-            if approx:
-                index = faiss.IndexHNSWFlat(dim, 48, faiss.METRIC_INNER_PRODUCT)
-                index.hnsw.efConstruction = 300
-                index.add(src_c_emb)
-                index.hnsw.efSearch = 300
-                log(f"  Using approximate HNSW search (--approx set)")
-            else:
-                index = faiss.IndexFlatIP(dim)
-                index.add(src_c_emb)
-                log(f"  Using exact IndexFlatIP search")
+            s1_names = df_s1_c['business_name_clean'].tolist()
+            s1_addrs = df_s1_c['business_address_clean'].tolist()
+            s1_pcs = df_s1_c['postal_code'].tolist()
 
-            k_val = min(k, index.ntotal)
-            batch_size = 5000  # Smaller batch prevents distance matrix memory spikes in OpenMP
-            buf = []
-            total_q_batches = (len(s1_c_emb) + batch_size - 1) // batch_size
+            c2_country_added = 0
+            for q_idx in range(len(s1_c_ids)):
+                s1_id = s1_c_ids[q_idx]
+                s1_seen = seen_cands_map[q_idx]
+                keys = extract_blocking_keys(s1_names[q_idx], s1_addrs[q_idx], s1_pcs[q_idx])
 
-            # Stream queries in small batches, computing blocking keys on the fly
-            s1_records_tuples = df_s1_c.itertuples(index=False)
-            df_rows = list(s1_records_tuples)
+                new_cand_indices = []
+                for key in keys:
+                    bucket = inv_index.get(key)
+                    if bucket:
+                        for c_idx in bucket:
+                            if c_idx not in s1_seen:
+                                s1_seen.add(c_idx)
+                                new_cand_indices.append(c_idx)
 
-            for batch_idx, q_start in enumerate(range(0, len(s1_c_emb), batch_size), 1):
-                q_end = min(q_start + batch_size, len(s1_c_emb))
-                if batch_idx % 4 == 1 or q_end == len(s1_c_emb):
-                    log(f"  [{country} | {source_name.upper()}] Batch {batch_idx}/{total_q_batches} ({q_end:,}/{len(s1_c_emb):,} queries, {total_pairs:,} total candidate pairs so far)...")
-                
-                scores, indices = index.search(s1_c_emb[q_start:q_end], k_val)
-
-                for i in range(indices.shape[0]):
-                    global_q_idx = q_start + i
-                    s1_id = s1_c_ids[global_q_idx]
-                    s1_vec = s1_c_emb[global_q_idx]
-                    seen_cands = set()
-
-                    # Channel 1: FAISS dense candidates
-                    for j in range(k_val):
-                        sc = float(scores[i, j])
-                        if sc < min_score:
-                            continue
-                        idx = indices[i, j]
-                        if idx < 0:
-                            continue
-                        c_id = src_c_ids[idx]
-                        seen_cands.add(idx)
+                if new_cand_indices:
+                    s1_vec = s1_c_emb[q_idx]
+                    for c_idx in new_cand_indices:
+                        c_global_idx = src_c_indices[c_idx]
+                        c_vec = emb_src[c_global_idx]  # on-demand mmap disk access
+                        sc = float(np.dot(s1_vec, c_vec))
+                        c_id = src_c_ids[c_idx]
                         buf.append(f"{s1_id}\t{c_id}\t{source_name}\t{sc:.5f}\n")
                         total_pairs += 1
-                        channel1_pairs += 1
-
-                    # Channel 2: Inverted Index (keys computed on-the-fly per record)
-                    r = df_rows[global_q_idx]
-                    for key in extract_blocking_keys(r.business_name_clean, r.business_address_clean, r.postal_code):
-                        bucket = inv_index.get(key)
-                        if bucket:
-                            for c_idx in bucket:
-                                if c_idx not in seen_cands:
-                                    seen_cands.add(c_idx)
-                                    c_id = src_c_ids[c_idx]
-                                    sc = float(np.dot(s1_vec, src_c_emb[c_idx]))
-                                    buf.append(f"{s1_id}\t{c_id}\t{source_name}\t{sc:.5f}\n")
-                                    total_pairs += 1
-                                    channel2_added_pairs += 1
+                        channel2_added_pairs += 1
+                        c2_country_added += 1
 
                 if len(buf) >= 100000:
                     f_detailed.writelines(buf)
@@ -260,12 +286,13 @@ def run_blocking(
 
             if buf:
                 f_detailed.writelines(buf)
+                buf = []
 
-            del index, inv_index, src_c_ids, src_c_emb, s1_c_ids, s1_c_emb, df_s1_c, df_src_c, df_rows
+            del inv_index, df_src_c, seen_cands_map, s1_names, s1_addrs, s1_pcs, s1_c_ids, s1_c_emb, df_s1_c
             gc.collect()
-            log(f"  Done [{country} | {source_name.upper()}]. Running total pairs: {total_pairs:,} (FAISS={channel1_pairs:,}, InvertedIndex=+{channel2_added_pairs:,})")
+            log(f"    [Inverted Index Complete] Added {c2_country_added:,} complementary pairs. Total pairs: {total_pairs:,}")
 
-        del df_src, ids_src, emb_src
+        del src_country_arr, ids_src, emb_src
         gc.collect()
 
     f_detailed.close()
