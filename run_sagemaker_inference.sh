@@ -25,7 +25,7 @@ python code/business_entity_resolution/src/preprocess.py --split test --workers 
 
 # 4. Generate Embeddings (Dense Semantic Representation on GPU with Tensor Core FP16)
 echo -e "\n>>> Step 4: Generating embeddings for test entities on GPU..."
-python code/business_entity_resolution/src/embed_entities.py --split test --batch-size 512
+python code/business_entity_resolution/src/embed_entities.py --split test --batch-size 256
 
 # 5. Hybrid Blocking (FAISS Exact + Multi-Key Inverted Index)
 echo -e "\n>>> Step 5: Running Hybrid Blocking..."

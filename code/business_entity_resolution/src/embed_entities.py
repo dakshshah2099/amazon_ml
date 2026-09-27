@@ -46,30 +46,51 @@ def embed_split(split='train', batch_size=256, max_seq_length=64, data_dir=None,
         df = pd.read_parquet(parquet_path, columns=[
             'entity_id', 'business_name_for_embedding', 'business_address_for_embedding'
         ])
+        entity_ids = df['entity_id'].to_numpy()
+        np.save(ids_path, entity_ids)
 
         combined = (
             df['business_name_for_embedding'].fillna('') + ' | ' +
             df['business_address_for_embedding'].fillna('')
         ).tolist()
 
-        log(f"Encoding {len(combined):,} records (batch_size={batch_size}, FP16={device == 'cuda'})...")
+        del df, entity_ids
+        import gc
+        gc.collect()
+
+        n_total = len(combined)
+        log(f"Encoding {n_total:,} records in memory-safe 100k chunks (batch_size={batch_size}, FP16={device == 'cuda'})...")
         t0 = time.time()
+
+        embeddings = np.empty((n_total, 384), dtype=np.float32)
+        chunk_step = 100_000
+
         with torch.inference_mode():
-            embeddings = model.encode(
-                combined,
-                batch_size=batch_size,
-                show_progress_bar=True,
-                convert_to_numpy=True,
-                normalize_embeddings=True,
-                device=device
-            ).astype(np.float32)
-        log(f"Encoded in {time.time()-t0:.1f}s ({len(combined)/(time.time()-t0):.0f} records/s)")
+            for c_start in range(0, n_total, chunk_step):
+                c_end = min(c_start + chunk_step, n_total)
+                sub_texts = combined[c_start:c_end]
+                sub_emb = model.encode(
+                    sub_texts,
+                    batch_size=batch_size,
+                    show_progress_bar=True,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                    device=device
+                )
+                embeddings[c_start:c_end] = sub_emb.astype(np.float32)
+                del sub_texts, sub_emb
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+
+        elapsed = time.time() - t0
+        log(f"Encoded {n_total:,} in {elapsed:.1f}s ({n_total/elapsed:.0f} records/s)")
 
         np.save(out_path, embeddings)
-        np.save(ids_path, df['entity_id'].to_numpy())
         log(f"Saved {out_path} ({embeddings.shape}) and {ids_path}")
 
-        del df, combined, embeddings
+        del combined, embeddings
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
