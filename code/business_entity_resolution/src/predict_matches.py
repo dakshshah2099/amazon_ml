@@ -65,10 +65,11 @@ def predict_matches(
     data_dir=None,
     prefix=None,
     eval_gt_path=None,
-    threshold=None
+    threshold=None,
+    min_cand_score=0.48
 ):
     log("=" * 70)
-    log(f"STAGE 5: INFERENCE ({split.upper()}) WITH NO INFERENCE-TIME PRE-FILTERING")
+    log(f"STAGE 5: INFERENCE ({split.upper()}) | min_cand_score={min_cand_score}")
     log("=" * 70)
 
     # 1. Load Models and Metadata
@@ -148,7 +149,11 @@ def predict_matches(
             usecols=['source1_entity_id', 'candidate_entity_id', 'embed_score'],
             dtype={'source1_entity_id': str, 'candidate_entity_id': str, 'embed_score': float},
             chunksize=chunksize
-        )):
+            if min_cand_score is not None and min_cand_score > 0.0:
+                chunk = chunk[chunk['embed_score'] >= min_cand_score]
+                if len(chunk) == 0:
+                    continue
+
             if s1_filter_set is not None:
                 chunk = chunk[chunk['source1_entity_id'].isin(s1_filter_set)]
                 if len(chunk) == 0:
@@ -310,6 +315,7 @@ if __name__ == '__main__':
     parser.add_argument('--sample-s1', type=int, default=None, help='Sample N S1 entities for rapid evaluation')
     parser.add_argument('--eval-gt', default=None, help='Ground truth TSV path to evaluate against')
     parser.add_argument('--threshold', type=float, default=None, help='Decision threshold override')
+    parser.add_argument('--min-cand-score', type=float, default=0.48, help='Filter candidate pairs below this similarity')
     args = parser.parse_args()
     predict_matches(
         split=args.split,
@@ -322,6 +328,7 @@ if __name__ == '__main__':
         sample_s1=args.sample_s1,
         eval_gt_path=args.eval_gt,
         threshold=args.threshold,
+        min_cand_score=args.min_cand_score,
         data_dir=args.data_dir,
         prefix=args.prefix
     )
