@@ -17,10 +17,19 @@ STOP_TOKENS = {
     'holdings', 'technologies', 'solutions', 'consulting', 'management'
 }
 
+ADDR_STRUCT_STOPS = {
+    'floor', 'ground', 'first', 'second', 'third', 'fourth', 'fifth',
+    'suite', 'flat', 'unit', 'room', 'building', 'bldg', 'block', 'plot',
+    'shop', 'road', 'street', 'avenue', 'lane', 'drive', 'blvd', 'boulevard',
+    'highway', 'near', 'opp', 'opposite', 'behind', 'cross', 'main', 'nagar',
+    'colony', 'sector', 'phase', 'post', 'dist', 'state', 'india', 'usa'
+}
+
 def extract_blocking_keys(name, addr, pc):
     """
     Extracts high-precision complementary blocking keys for inverted index lookup.
-    All keys are case-normalized and strip common corporate stops.
+    Includes dedicated street number indexing, name signatures, and exact matches.
+    All keys are case-normalized and strip common corporate and structural stops.
     """
     keys = []
     name_str = (name or '').lower()
@@ -28,8 +37,8 @@ def extract_blocking_keys(name, addr, pc):
     pc_str = (pc or '').strip()
 
     name_toks = [t for t in re.findall(r'\b\w+\b', name_str) if t not in STOP_TOKENS and len(t) > 2]
-    addr_toks = [t for t in re.findall(r'\b[a-z]+\b', addr_str) if len(t) > 3 and t not in STOP_TOKENS]
-    addr_nums = re.findall(r'\b\d+\b', addr_str)
+    addr_toks = [t for t in re.findall(r'\b[a-z]+\b', addr_str) if len(t) > 3 and t not in STOP_TOKENS and t not in ADDR_STRUCT_STOPS]
+    addr_nums = re.findall(r'\b\d+[a-z]?\b', addr_str)
 
     # 1. Exact clean name (if >= 4 chars)
     if len(name_str) >= 4:
@@ -45,7 +54,7 @@ def extract_blocking_keys(name, addr, pc):
     elif len(name_toks) == 1:
         keys.append(('n_1tok', name_toks[0]))
 
-    # 4. Street number + first address token
+    # 4. Street number + first informative address token
     if addr_nums and addr_toks:
         keys.append(('a_num_tok', f"{addr_nums[0]}_{addr_toks[0]}"))
 
@@ -57,7 +66,14 @@ def extract_blocking_keys(name, addr, pc):
     if pc_str and addr_nums:
         keys.append(('pc_num', f"{pc_str}_{addr_nums[0]}"))
 
-    # 7. Rare non-stop name tokens
+    # 7. Street number pure index (capped by max_bucket_size) + street number with primary name token
+    for num in addr_nums[:2]:
+        if len(num) >= 2:
+            keys.append(('street_num', num))
+            if name_toks:
+                keys.append(('s_num_name', f"{num}_{name_toks[0]}"))
+
+    # 8. Rare non-stop name tokens
     for t in name_toks:
         if len(t) >= 4:
             keys.append(('rare_tok', t))
