@@ -1,0 +1,35 @@
+# Python & Virtual Environments
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Heavy Datasets & Embeddings (upload to S3, do not track in Git)
+dataset/
+*.parquet
+*.npy
+*.tsv
+*.csv
+
+# Outputs & Artifacts
+output/
+output_sample50k/
+output_v2/
+models/
+models_sample50k/
+catboost_info/
+*.log
+
+# Scratch
+scratch/
