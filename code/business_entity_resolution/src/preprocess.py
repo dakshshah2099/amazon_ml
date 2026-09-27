@@ -142,9 +142,24 @@ def process_file(in_path, out_path, chunksize=100000, batch_size=5000, max_worke
         print(f"  TRANS NAME:   {ex[8]} | TRANS ADDR: {ex[9]}")
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--split', type=str, default='all', choices=['all', 'train', 'test'],
+                        help='Split to process: train, test, or all')
+    parser.add_argument('--workers', type=int, default=8, help='Number of worker processes')
+    args = parser.parse_args()
+
     random.seed(42)
     overall_start = time.time()
-    for in_path, out_path in FILES:
+
+    if args.split == 'train':
+        target_files = [f for f in FILES if 'train' in f[0]]
+    elif args.split == 'test':
+        target_files = [f for f in FILES if 'test' in f[0]]
+    else:
+        target_files = FILES
+
+    for in_path, out_path in target_files:
         if not os.path.exists(in_path):
             print(f"Error: {in_path} does not exist!")
             sys.exit(1)
@@ -159,9 +174,9 @@ def main():
             except Exception:
                 pass
 
-        process_file(in_path, out_path)
+        process_file(in_path, out_path, max_workers=args.workers)
     print(f"\n==================================================")
-    print(f"ALL 6 FILES PROCESSED SUCCESSFULLY in {time.time() - overall_start:.2f}s!")
+    print(f"ALL REQUESTED FILES PROCESSED SUCCESSFULLY in {time.time() - overall_start:.2f}s!")
     print(f"==================================================")
 
 if __name__ == '__main__':

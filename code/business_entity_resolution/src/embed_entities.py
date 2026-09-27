@@ -19,8 +19,15 @@ def embed_split(split='train', batch_size=256, max_seq_length=64, data_dir=None,
     if prefix is None:
         prefix = split
 
-    log("Loading embedding model on GPU...")
-    model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2', device='cuda')
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if device == 'cpu':
+        num_threads = min(os.cpu_count() or 4, 8)
+        torch.set_num_threads(num_threads)
+        log(f"CUDA not detected. Running SentenceTransformer on CPU with {num_threads} threads...")
+    else:
+        log(f"CUDA detected ({torch.cuda.get_device_name(0)}). Running SentenceTransformer on GPU...")
+
+    model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2', device=device)
     model.max_seq_length = max_seq_length
 
     for source_num in [1, 2, 3]:
@@ -42,7 +49,7 @@ def embed_split(split='train', batch_size=256, max_seq_length=64, data_dir=None,
             df['business_address_for_embedding'].fillna('')
         ).tolist()
 
-        log(f"Encoding {len(combined):,} records (batch_size={batch_size})...")
+        log(f"Encoding {len(combined):,} records (batch_size={batch_size}, device={device})...")
         t0 = time.time()
         embeddings = model.encode(
             combined,
@@ -50,7 +57,7 @@ def embed_split(split='train', batch_size=256, max_seq_length=64, data_dir=None,
             show_progress_bar=True,
             convert_to_numpy=True,
             normalize_embeddings=True,
-            device='cuda'
+            device=device
         ).astype(np.float32)
         log(f"Encoded in {time.time()-t0:.1f}s")
 
@@ -59,7 +66,8 @@ def embed_split(split='train', batch_size=256, max_seq_length=64, data_dir=None,
         log(f"Saved {out_path} ({embeddings.shape}) and {ids_path}")
 
         del df, combined, embeddings
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
