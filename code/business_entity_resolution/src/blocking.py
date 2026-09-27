@@ -6,6 +6,11 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 import faiss
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
 
 def log(msg):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
@@ -183,34 +188,43 @@ def run_blocking(
             country_pairs = 0
 
             # -------------------------------------------------------------
-            # STAGE 1: Dense FAISS Search (Channel 1)
+            # STAGE 1: Dense Search (GPU Tensor Cores if CUDA, else FAISS CPU)
             # -------------------------------------------------------------
-            log(f"  [Stage 1/2: FAISS] Indexing {len(src_c_ids):,} candidate embeddings...")
             src_c_emb = np.ascontiguousarray(emb_src[src_c_indices], dtype=np.float32)
-            dim = src_c_emb.shape[1]
-            if approx:
-                index = faiss.IndexHNSWFlat(dim, 48, faiss.METRIC_INNER_PRODUCT)
-                index.hnsw.efConstruction = 300
-                index.add(src_c_emb)
-                index.hnsw.efSearch = 300
+            k_val = min(k, len(src_c_indices))
+            use_gpu = HAS_TORCH and torch.cuda.is_available()
+
+            if use_gpu:
+                gpu_name = torch.cuda.get_device_name(0)
+                log(f"  [Stage 1/2: Dense GPU Search] Utilizing {gpu_name} (Tensor Core FP16 matrix multiplication + topk)!")
+                cand_gpu = torch.from_numpy(src_c_emb).to('cuda', dtype=torch.float16)
+                batch_size = 10000
             else:
+                log(f"  [Stage 1/2: Dense CPU Search] Fallback to FAISS CPU IndexFlatIP...")
+                dim = src_c_emb.shape[1]
                 index = faiss.IndexFlatIP(dim)
                 index.add(src_c_emb)
+                batch_size = 5000
 
-            k_val = min(k, index.ntotal)
-            batch_size = 5000
             buf = []
             total_q_batches = (len(s1_c_emb) + batch_size - 1) // batch_size
-
-            # seen_cands_map: track FAISS candidate indices per S1 query to avoid duplicate scoring in Stage 2
             seen_cands_map = [set() for _ in range(len(s1_c_ids))]
 
             for batch_idx, q_start in enumerate(range(0, len(s1_c_emb), batch_size), 1):
                 q_end = min(q_start + batch_size, len(s1_c_emb))
-                if batch_idx % 4 == 1 or q_end == len(s1_c_emb):
-                    log(f"    [FAISS | {country}] Batch {batch_idx}/{total_q_batches} ({q_end:,}/{len(s1_c_emb):,} queries)...")
-                
-                scores, indices = index.search(s1_c_emb[q_start:q_end], k_val)
+                if batch_idx % 5 == 1 or q_end == len(s1_c_emb):
+                    log(f"    [Dense {'GPU' if use_gpu else 'FAISS'} | {country}] Batch {batch_idx}/{total_q_batches} ({q_end:,}/{len(s1_c_emb):,} queries)...")
+
+                if use_gpu:
+                    q_batch_gpu = torch.from_numpy(s1_c_emb[q_start:q_end]).to('cuda', dtype=torch.float16)
+                    with torch.inference_mode():
+                        sims = torch.matmul(q_batch_gpu, cand_gpu.T)
+                        scores_t, indices_t = torch.topk(sims, k=k_val, dim=1)
+                    scores = scores_t.cpu().numpy()
+                    indices = indices_t.cpu().numpy()
+                    del q_batch_gpu, sims, scores_t, indices_t
+                else:
+                    scores, indices = index.search(s1_c_emb[q_start:q_end], k_val)
 
                 for i in range(indices.shape[0]):
                     global_q_idx = q_start + i
@@ -219,7 +233,7 @@ def run_blocking(
                         sc = float(scores[i, j])
                         if sc < min_score:
                             continue
-                        c_idx = indices[i, j]
+                        c_idx = int(indices[i, j])
                         if c_idx < 0:
                             continue
                         seen_cands_map[global_q_idx].add(c_idx)
@@ -239,10 +253,15 @@ def run_blocking(
                 f_part.flush()
                 buf = []
 
-            # Purge FAISS index and candidate embeddings immediately from RAM
-            del index, src_c_emb
+            # Purge dense search data from RAM/VRAM
+            if use_gpu:
+                del cand_gpu
+                torch.cuda.empty_cache()
+            else:
+                del index
+            del src_c_emb
             gc.collect()
-            log(f"    [FAISS Complete] Freed candidate embeddings. Intermediate pairs so far: {country_pairs:,}")
+            log(f"    [Dense {'GPU' if use_gpu else 'FAISS'} Complete] Freed candidate embeddings. Intermediate pairs so far: {country_pairs:,}")
 
             # -------------------------------------------------------------
             # STAGE 2: Inverted Index Lexical Blocking (Channel 2)
