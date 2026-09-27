@@ -119,20 +119,26 @@ def run_blocking(
     log(f"Countries: {countries}")
 
     detailed_file = os.path.join(out_dir, f"{split}_candidate_pairs_detailed.tsv")
-    f_detailed = open(detailed_file, 'w', encoding='utf-8')
-    f_detailed.write("source1_entity_id\tcandidate_entity_id\tsource\tembed_score\n")
-
     total_pairs = 0
     channel1_pairs = 0
     channel2_added_pairs = 0
 
     import gc
 
-    # Process Candidate Sources sequentially
+    # Process Candidate Sources sequentially with isolated per-country intermediate writes
     for source_name in ['source2', 'source3']:
         log("=" * 60)
         log(f"BLOCKING CANDIDATE SOURCE: {source_name.upper()}")
         log("=" * 60)
+
+        # Check if all countries for this source are already completed
+        all_countries_done = all(
+            os.path.exists(os.path.join(out_dir, f"{split}_candidates_{source_name}_{c}.done"))
+            for c in countries
+        )
+        if all_countries_done:
+            log(f"All country checkpoints for {source_name} already completed on disk. Skipping source.")
+            continue
 
         # Read ONLY country column to get country indices without loading entire dataframe
         df_src_countries = pd.read_parquet(f"{prefix}_{source_name}_clean.parquet", columns=['country'])
@@ -146,6 +152,13 @@ def run_blocking(
         assert len(emb_src) == len(ids_src) == len(src_country_arr), f"{source_name} count mismatch"
 
         for country in countries:
+            part_file = os.path.join(out_dir, f"{split}_candidates_{source_name}_{country}.tsv")
+            part_done = os.path.join(out_dir, f"{split}_candidates_{source_name}_{country}.done")
+
+            if os.path.exists(part_done) and os.path.exists(part_file):
+                log(f"\n[Checkpoint Exists] {part_file} is marked complete — skipping {source_name} [{country}].")
+                continue
+
             log(f"\n>>> Country: {country} [{source_name.upper()}] <<<")
             s1_mask = (df_s1['country'] == country).to_numpy()
             s1_c_indices = np.where(s1_mask)[0]
@@ -159,9 +172,15 @@ def run_blocking(
 
             if len(src_c_ids) == 0 or len(s1_c_ids) == 0:
                 log(f"  {source_name}: empty subset, skipping")
+                with open(part_done, 'w') as f_d:
+                    f_d.write('empty\n')
                 continue
 
             log(f"  Subset counts: S1={len(s1_c_ids):,} vs Candidates={len(src_c_ids):,}")
+
+            # Open atomic intermediate file for this country/source partition
+            f_part = open(part_file, 'w', encoding='utf-8')
+            country_pairs = 0
 
             # -------------------------------------------------------------
             # STAGE 1: Dense FAISS Search (Channel 1)
@@ -207,20 +226,23 @@ def run_blocking(
                         c_id = src_c_ids[c_idx]
                         buf.append(f"{s1_id}\t{c_id}\t{source_name}\t{sc:.5f}\n")
                         total_pairs += 1
+                        country_pairs += 1
                         channel1_pairs += 1
 
                 if len(buf) >= 100000:
-                    f_detailed.writelines(buf)
+                    f_part.writelines(buf)
+                    f_part.flush()
                     buf = []
 
             if buf:
-                f_detailed.writelines(buf)
+                f_part.writelines(buf)
+                f_part.flush()
                 buf = []
 
             # Purge FAISS index and candidate embeddings immediately from RAM
             del index, src_c_emb
             gc.collect()
-            log(f"    [FAISS Complete] Freed candidate embeddings. Running total pairs: {total_pairs:,}")
+            log(f"    [FAISS Complete] Freed candidate embeddings. Intermediate pairs so far: {country_pairs:,}")
 
             # -------------------------------------------------------------
             # STAGE 2: Inverted Index Lexical Blocking (Channel 2)
@@ -277,26 +299,48 @@ def run_blocking(
                         c_id = src_c_ids[c_idx]
                         buf.append(f"{s1_id}\t{c_id}\t{source_name}\t{sc:.5f}\n")
                         total_pairs += 1
+                        country_pairs += 1
                         channel2_added_pairs += 1
                         c2_country_added += 1
 
                 if len(buf) >= 100000:
-                    f_detailed.writelines(buf)
+                    f_part.writelines(buf)
+                    f_part.flush()
                     buf = []
 
             if buf:
-                f_detailed.writelines(buf)
+                f_part.writelines(buf)
+                f_part.flush()
                 buf = []
+
+            f_part.close()
+            with open(part_done, 'w') as f_d:
+                f_d.write(f"{country_pairs}\n")
+            log(f"  [Checkpoint Written] Flushed {country_pairs:,} pairs to {part_file} and marked done.")
 
             del inv_index, df_src_c, seen_cands_map, s1_names, s1_addrs, s1_pcs, s1_c_ids, s1_c_emb, df_s1_c
             gc.collect()
-            log(f"    [Inverted Index Complete] Added {c2_country_added:,} complementary pairs. Total pairs: {total_pairs:,}")
 
         del src_country_arr, ids_src, emb_src
         gc.collect()
 
-    f_detailed.close()
-    log(f"Saved {detailed_file} ({total_pairs:,} total pairs)")
+    # Consolidate all intermediate country files into master detailed file
+    log("=" * 60)
+    log(f"CONSOLIDATING INTERMEDIATE CHECKPOINTS INTO {detailed_file}...")
+    log("=" * 60)
+    total_master_pairs = 0
+    with open(detailed_file, 'w', encoding='utf-8') as f_out:
+        f_out.write("source1_entity_id\tcandidate_entity_id\tsource\tembed_score\n")
+        for s in ['source2', 'source3']:
+            for c in countries:
+                p = os.path.join(out_dir, f"{split}_candidates_{s}_{c}.tsv")
+                if os.path.exists(p):
+                    with open(p, 'r', encoding='utf-8') as f_in:
+                        for chunk in iter(lambda: f_in.read(2 * 1024 * 1024), ''):
+                            f_out.write(chunk)
+                            total_master_pairs += chunk.count('\n')
+
+    log(f"Saved {detailed_file} ({total_master_pairs:,} total rows)")
 
     final_cand_file = os.path.join(out_dir, f"{split}_candidate_pairs.tsv" if split == 'train' else "candidate_pairs.tsv")
     log(f"Writing {final_cand_file} from detailed candidate pairs...")

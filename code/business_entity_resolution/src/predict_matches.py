@@ -229,9 +229,11 @@ def predict_matches(
             buf.append(f"{s1_id}\t{matched_str}\n")
             if len(buf) >= 100_000:
                 f.writelines(buf)
+                f.flush()
                 buf = []
         if buf:
             f.writelines(buf)
+            f.flush()
 
     log(f"Saved {out_path} with {len(s1_order_list):,} total rows.")
 
